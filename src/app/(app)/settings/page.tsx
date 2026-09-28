@@ -1,8 +1,8 @@
 import {
+  BookUp2,
   CalendarDays,
   DatabaseZap,
   FileSpreadsheet,
-  Github,
   Palette,
   PlugZap,
   Smartphone,
@@ -74,7 +74,7 @@ export default function SettingsPage() {
         </article>
 
         <article className="rounded-xl border border-border bg-card p-5">
-          <div className="flex gap-3"><span className="grid size-9 place-items-center rounded-lg bg-muted"><Github className="size-4" /></span><div><h2 className="font-semibold">Deployment workflow</h2><p className="mt-1 text-sm text-muted-foreground">Laptop folder → GitHub → Vercel. The repository is the source of truth.</p></div></div>
+          <div className="flex gap-3"><span className="grid size-9 place-items-center rounded-lg bg-muted"><BookUp2 className="size-4" /></span><div><h2 className="font-semibold">Deployment workflow</h2><p className="mt-1 text-sm text-muted-foreground">Laptop folder → GitHub → Vercel. The repository is the source of truth.</p></div></div>
           <div className="mt-4 rounded-lg bg-muted p-4 font-mono text-xs leading-6 text-muted-foreground">
             git add .<br />
             git commit -m &quot;feat: improve tracker&quot;<br />
