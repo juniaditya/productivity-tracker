@@ -10,7 +10,7 @@ import {
   Paintbrush,
   Save,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { formatDateKey, shiftDateKey } from "@/lib/date";
 import { formatDuration, minuteLabel } from "@/lib/format";
 import { createClient } from "@/lib/supabase/client";
@@ -73,10 +73,7 @@ function slotsToBlocks(slots: SlotMap, notes: NoteMap, date: string) {
 export function TimelineEditor({ initialDate, initialCategories, initialBlocks }: Props) {
   const categories = initialCategories;
   const activeCategories = useMemo(() => categories.filter((category) => category.is_active), [categories]);
-  const categoryMap = useMemo(
-    () => new Map(categories.map((category) => [category.id, category])),
-    [categories],
-  );
+  const categoryMap = useMemo(() => new Map(categories.map((category) => [category.id, category])), [categories]);
   const initialState = useMemo(() => blockState(initialBlocks), [initialBlocks]);
   const [cursor, setCursor] = useState(initialDate);
   const [slots, setSlots] = useState<SlotMap>(() => initialState.slots);
@@ -90,18 +87,24 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const dragging = useRef(false);
+  const mutationVersion = useRef(0);
+  const saveInFlight = useRef(false);
 
   const totals = useMemo(() => {
     const map: Record<string, number> = {};
-    Object.values(slots).forEach((entries) =>
-      entries.forEach((categoryId) => {
-        map[categoryId] = (map[categoryId] ?? 0) + 15;
-      }),
-    );
+    Object.values(slots).forEach((entries) => entries.forEach((categoryId) => {
+      map[categoryId] = (map[categoryId] ?? 0) + 15;
+    }));
     return map;
   }, [slots]);
 
   const tracked = Object.values(slots).filter((entries) => entries.length > 0).length * 15;
+
+  function markChanged() {
+    mutationVersion.current += 1;
+    setDirty(true);
+    setMessage(null);
+  }
 
   function cellBackground(entries: string[]) {
     if (!entries.length) return "transparent";
@@ -113,19 +116,27 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
 
   function apply(slot: number) {
     if (mode === "select" || !selected) return;
+    let changed = false;
     setSlots((current) => {
       const next = { ...current };
       const entries = [...(next[slot] ?? [])];
       if (mode === "paint") {
-        if (!entries.includes(selected) && entries.length < 2) entries.push(selected);
+        if (!entries.includes(selected) && entries.length < 2) {
+          entries.push(selected);
+          changed = true;
+        }
       } else {
         const index = entries.indexOf(selected);
-        if (index >= 0) entries.splice(index, 1);
+        if (index >= 0) {
+          entries.splice(index, 1);
+          changed = true;
+        }
       }
       if (entries.length) next[slot] = entries;
       else delete next[slot];
       return next;
     });
+    if (!changed) return;
     if (mode === "erase") {
       setNotes((currentNotes) => {
         const nextNotes = { ...currentNotes };
@@ -133,12 +144,53 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
         return nextNotes;
       });
     }
-    setDirty(true);
-    setMessage(null);
+    markChanged();
   }
 
+  const save = useCallback(async (silent = false) => {
+    if (saveInFlight.current) return false;
+    saveInFlight.current = true;
+    const versionAtStart = mutationVersion.current;
+    setSaving(true);
+    setError(null);
+    if (!silent) setMessage(null);
+
+    const supabase = createClient();
+    const blocks = slotsToBlocks(slots, notes, cursor).map((block) => ({
+      start_minute: block.start_minute,
+      end_minute: block.end_minute,
+      category_id: block.category_id,
+      note: block.note,
+    }));
+    const { error: saveError } = await supabase.rpc("save_day_time_blocks", {
+      p_activity_date: cursor,
+      p_blocks: blocks,
+    });
+
+    saveInFlight.current = false;
+    setSaving(false);
+    if (saveError) {
+      setError(saveError.message);
+      return false;
+    }
+    if (mutationVersion.current === versionAtStart) setDirty(false);
+    setMessage(silent ? "Autosaved" : "Tersimpan ke Supabase");
+    return true;
+  }, [cursor, notes, slots]);
+
+  useEffect(() => {
+    if (!dirty || loading || saving) return;
+    const timer = window.setTimeout(() => {
+      void save(true);
+    }, 1200);
+    return () => window.clearTimeout(timer);
+  }, [dirty, loading, notes, save, saving, slots]);
+
   async function loadDate(nextDate: string) {
-    if (dirty && !window.confirm("Ada perubahan yang belum disimpan. Pindah tanggal dan buang perubahan?")) return;
+    if (dirty) {
+      const saved = await save(true);
+      if (!saved && !window.confirm("Autosave gagal. Tetap pindah tanggal dan buang perubahan lokal?")) return;
+    }
     setLoading(true);
     setError(null);
     setMessage(null);
@@ -158,31 +210,8 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     setSlots(nextState.slots);
     setNotes(nextState.notes);
     setFocusedSlot(null);
+    mutationVersion.current = 0;
     setDirty(false);
-  }
-
-  async function save() {
-    setSaving(true);
-    setError(null);
-    setMessage(null);
-    const supabase = createClient();
-    const blocks = slotsToBlocks(slots, notes, cursor).map((block) => ({
-      start_minute: block.start_minute,
-      end_minute: block.end_minute,
-      category_id: block.category_id,
-      note: block.note,
-    }));
-    const { error: saveError } = await supabase.rpc("save_day_time_blocks", {
-      p_activity_date: cursor,
-      p_blocks: blocks,
-    });
-    setSaving(false);
-    if (saveError) {
-      setError(saveError.message);
-      return;
-    }
-    setDirty(false);
-    setMessage("Tersimpan ke Supabase");
   }
 
   function setRunNote(categoryId: string, slot: number, value: string) {
@@ -199,8 +228,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
       }
       return next;
     });
-    setDirty(true);
-    setMessage(null);
+    markChanged();
   }
 
   return (
@@ -216,14 +244,14 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     >
       <div className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex flex-wrap items-center gap-2">
-          <button onClick={() => loadDate(shiftDateKey(cursor, -1))} disabled={loading} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Previous day"><ChevronLeft className="size-4" /></button>
-          <button onClick={() => loadDate(initialDate)} disabled={loading} className="min-w-44 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">{formatDateKey(cursor, { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</button>
-          <button onClick={() => loadDate(shiftDateKey(cursor, 1))} disabled={loading} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Next day"><ChevronRight className="size-4" /></button>
-          {cursor !== initialDate ? <button onClick={() => loadDate(initialDate)} className="rounded-lg px-2 py-2 text-xs font-medium text-primary hover:bg-muted">Today</button> : null}
+          <button onClick={() => void loadDate(shiftDateKey(cursor, -1))} disabled={loading} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Previous day"><ChevronLeft className="size-4" /></button>
+          <button onClick={() => void loadDate(initialDate)} disabled={loading} className="min-w-44 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">{formatDateKey(cursor, { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</button>
+          <button onClick={() => void loadDate(shiftDateKey(cursor, 1))} disabled={loading} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Next day"><ChevronRight className="size-4" /></button>
+          {cursor !== initialDate ? <button onClick={() => void loadDate(initialDate)} className="rounded-lg px-2 py-2 text-xs font-medium text-primary hover:bg-muted">Today</button> : null}
         </div>
-        <div className="flex items-center gap-3 text-sm">
+        <div className="flex flex-wrap items-center gap-3 text-sm">
           {loading ? <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" /> Loading</span> : null}
-          {dirty ? <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">Unsaved</span> : null}
+          {saving ? <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"><Loader2 className="size-3 animate-spin" /> Autosaving</span> : dirty ? <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">Pending save</span> : <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">Synced</span>}
           <span className="text-muted-foreground">Coverage</span>
           <span className="font-mono font-medium tabular-nums">{formatDuration(tracked)} · {Math.round((tracked / 1440) * 100)}%</span>
         </div>
@@ -235,15 +263,10 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
       <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_300px]">
         <section className="overflow-hidden rounded-xl border border-border bg-card">
           <div className="sticky top-0 z-10 border-b border-border bg-card/95 p-3 backdrop-blur">
-            <div className="flex flex-wrap gap-2">
+            <div className="flex gap-2 overflow-x-auto pb-1 sm:flex-wrap sm:overflow-visible">
               {activeCategories.map((category) => (
-                <button
-                  key={category.id}
-                  onClick={() => setSelected(category.id)}
-                  className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${selected === category.id ? "border-foreground bg-foreground text-background" : "border-border hover:bg-muted"}`}
-                >
-                  <span className="size-2 rounded-full" style={{ background: category.color }} />
-                  {category.name}
+                <button key={category.id} onClick={() => setSelected(category.id)} className={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${selected === category.id ? "border-foreground bg-foreground text-background" : "border-border hover:bg-muted"}`}>
+                  <span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}
                 </button>
               ))}
             </div>
@@ -253,13 +276,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
                 ["paint", Paintbrush, "Isi"],
                 ["erase", Eraser, "Hapus"],
               ] as const).map(([value, Icon, label]) => (
-                <button
-                  key={value}
-                  onClick={() => setMode(value)}
-                  className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium ${mode === value ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}
-                >
-                  <Icon className="size-3.5" /> {label}
-                </button>
+                <button key={value} onClick={() => setMode(value)} className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium ${mode === value ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}><Icon className="size-3.5" /> {label}</button>
               ))}
             </div>
           </div>
@@ -273,25 +290,8 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
                 const names = entries.map((id) => categoryMap.get(id)?.name).filter(Boolean).join(", ");
                 return (
                   <div key={slot} className="contents">
-                    <div className={`flex h-4 items-start justify-end pr-1 font-mono text-[10px] tabular-nums ${hourMark ? "text-muted-foreground" : "text-transparent"}`}>
-                      {hourMark ? minuteLabel(minute) : "·"}
-                    </div>
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`${minuteLabel(minute)} ${names || "empty"}`}
-                      data-timeline-slot={slot}
-                      onPointerDown={() => {
-                        if (mode === "select") {
-                          setFocusedSlot(slot);
-                          return;
-                        }
-                        dragging.current = true;
-                        apply(slot);
-                      }}
-                      className={`h-4 touch-none border-t transition-[filter] hover:brightness-110 ${hourMark ? "border-border" : "border-border/35"}`}
-                      style={{ background: cellBackground(entries) }}
-                    />
+                    <div className={`flex h-4 items-start justify-end pr-1 font-mono text-[10px] tabular-nums ${hourMark ? "text-muted-foreground" : "text-transparent"}`}>{hourMark ? minuteLabel(minute) : "·"}</div>
+                    <div role="button" tabIndex={0} aria-label={`${minuteLabel(minute)} ${names || "empty"}`} data-timeline-slot={slot} onPointerDown={() => { if (mode === "select") { setFocusedSlot(slot); return; } dragging.current = true; apply(slot); }} className={`h-4 touch-none border-t transition-[filter] hover:brightness-110 ${hourMark ? "border-border" : "border-border/35"}`} style={{ background: cellBackground(entries) }} />
                   </div>
                 );
               })}
@@ -301,47 +301,24 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
 
         <aside className="space-y-4">
           <div className="rounded-xl border border-border bg-card p-4">
-            <div className="flex items-center justify-between">
-              <h2 className="font-semibold">Day totals</h2>
-              <span className="font-mono text-xs text-muted-foreground">activity time</span>
-            </div>
+            <div className="flex items-center justify-between"><h2 className="font-semibold">Day totals</h2><span className="font-mono text-xs text-muted-foreground">activity time</span></div>
             <div className="mt-3 space-y-2.5">
               {Object.entries(totals).length ? Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([categoryId, minutes]) => {
                 const category = categoryMap.get(categoryId);
                 if (!category) return null;
-                return (
-                  <div key={categoryId} className="flex items-center justify-between gap-3 text-sm">
-                    <span className="flex min-w-0 items-center gap-2 truncate"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span>
-                    <span className="font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(minutes)}</span>
-                  </div>
-                );
+                return <div key={categoryId} className="flex items-center justify-between gap-3 text-sm"><span className="flex min-w-0 items-center gap-2 truncate"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span><span className="font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(minutes)}</span></div>;
               }) : <p className="text-sm text-muted-foreground">Belum ada aktivitas pada tanggal ini.</p>}
             </div>
           </div>
 
           {focusedSlot !== null ? (
             <div className="rounded-xl border border-border bg-card p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div><h2 className="font-semibold">Block note</h2><p className="mt-1 font-mono text-xs text-muted-foreground">{minuteLabel(focusedSlot * 15)}</p></div>
-                <button onClick={() => setFocusedSlot(null)} className="text-xs font-medium text-muted-foreground hover:text-foreground">Close</button>
-              </div>
+              <div className="flex items-center justify-between gap-3"><div><h2 className="font-semibold">Block note</h2><p className="mt-1 font-mono text-xs text-muted-foreground">{minuteLabel(focusedSlot * 15)}</p></div><button onClick={() => setFocusedSlot(null)} className="text-xs font-medium text-muted-foreground hover:text-foreground">Close</button></div>
               <div className="mt-3 space-y-3">
                 {(slots[focusedSlot] ?? []).length ? (slots[focusedSlot] ?? []).map((categoryId) => {
                   const category = categoryMap.get(categoryId);
                   if (!category) return null;
-                  return (
-                    <label key={categoryId} className="block text-xs font-medium">
-                      <span className="mb-1.5 flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span>
-                      <textarea
-                        value={notes[`${focusedSlot}:${categoryId}`] ?? ""}
-                        onChange={(event) => setRunNote(categoryId, focusedSlot, event.target.value)}
-                        rows={3}
-                        maxLength={500}
-                        placeholder="Catatan opsional untuk block ini…"
-                        className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm font-normal outline-none focus:border-primary"
-                      />
-                    </label>
-                  );
+                  return <label key={categoryId} className="block text-xs font-medium"><span className="mb-1.5 flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span><textarea value={notes[`${focusedSlot}:${categoryId}`] ?? ""} onChange={(event) => setRunNote(categoryId, focusedSlot, event.target.value)} rows={3} maxLength={500} placeholder="Catatan opsional untuk block ini…" className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm font-normal outline-none focus:border-primary" /></label>;
                 }) : <p className="text-sm text-muted-foreground">Slot ini kosong. Pilih slot berwarna untuk memberi catatan.</p>}
               </div>
             </div>
@@ -350,15 +327,12 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
           <div className="rounded-xl border border-border bg-card p-4">
             <h2 className="font-semibold">15-minute rules</h2>
             <ul className="mt-3 space-y-2 text-sm leading-5 text-muted-foreground">
-              <li>• 96 slot per hari.</li>
-              <li>• Maksimum 2 aktivitas overlap pada satu slot.</li>
-              <li>• Coverage menghitung waktu unik, bukan jumlah aktivitas.</li>
-              <li>• Save mengganti data tanggal ini secara atomik.</li>
+              <li>• 96 slot per hari.</li><li>• Maksimum 2 aktivitas overlap pada satu slot.</li><li>• Coverage menghitung waktu unik, bukan jumlah aktivitas.</li><li>• Perubahan autosave ±1,2 detik setelah input berhenti.</li><li>• Save juga mengevaluasi habit automation.</li>
             </ul>
           </div>
 
-          <button onClick={save} disabled={saving || !dirty} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">
-            {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />} {saving ? "Saving…" : dirty ? "Save changes" : "Saved"}
+          <button onClick={() => void save(false)} disabled={saving || !dirty} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">
+            {saving ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />} {saving ? "Saving…" : dirty ? "Save now" : "Synced"}
           </button>
         </aside>
       </div>

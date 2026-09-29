@@ -46,10 +46,41 @@ export type HabitCheck = {
   note?: string | null;
 };
 
+export type HabitRule = {
+  id: string;
+  user_id: string;
+  habit_id: string;
+  source: "time_tracker" | "stayfree";
+  operator: "gte" | "lte";
+  threshold_minutes: number;
+  category_id: string | null;
+  match_type: "all" | "app" | "domain" | "device" | null;
+  match_value: string | null;
+  finalize_at_day_end: boolean;
+  is_active: boolean;
+};
+
+export type HabitRuleStatus = {
+  habit_id: string;
+  rule_source: "time_tracker" | "stayfree";
+  measured_minutes: number;
+  target_minutes: number;
+  rule_operator: "gte" | "lte";
+  status: "complete" | "pending" | "on_track" | "failed";
+};
+
 export type ScreenUsage = {
   usage_date: string;
   device: string | null;
   app_name: string | null;
   domain: string | null;
   duration_seconds: number;
+};
+
+export type ImportBatch = {
+  id: string;
+  source: "stayfree_csv" | "other";
+  file_name: string | null;
+  row_count: number;
+  imported_at: string;
 };

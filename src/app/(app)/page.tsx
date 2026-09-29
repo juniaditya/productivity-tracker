@@ -1,4 +1,4 @@
-import { Activity, CheckCircle2, Clock3, Smartphone } from "lucide-react";
+import { Activity, CheckCircle2, Clock3, Smartphone, Zap } from "lucide-react";
 import Link from "next/link";
 import { LiveDataBadge } from "@/components/live-data-badge";
 import { PageHeader } from "@/components/page-header";
@@ -29,6 +29,8 @@ export default async function TodayPage() {
   const today = dateKeyInTimeZone(new Date(), timezone);
   const week = weekRange(today);
 
+  await supabase.rpc("evaluate_habit_rules", { p_check_date: today });
+
   const [blocksResult, todayChecksResult, weekChecksResult, screenResult] = await Promise.all([
     supabase.from("time_blocks").select("id,activity_date,start_minute,end_minute,category_id,note,source").eq("activity_date", today).order("start_minute"),
     supabase.from("habit_checks").select("id,habit_id,check_date,checked,source,note").eq("check_date", today).eq("checked", true),
@@ -54,6 +56,7 @@ export default async function TodayPage() {
     .sort((a, b) => b.value - a.value);
 
   const checkedToday = new Set(todayChecks.map((check) => check.habit_id));
+  const todayCheckMap = new Map(todayChecks.map((check) => [check.habit_id, check]));
   const habitDone = checkedToday.size;
   const weeklyDoneByHabit = new Map<string, number>();
   for (const check of weekChecks) weeklyDoneByHabit.set(check.habit_id, (weeklyDoneByHabit.get(check.habit_id) ?? 0) + 1);
@@ -109,18 +112,20 @@ export default async function TodayPage() {
 
         <div className="grid gap-6">
           <article className="rounded-xl border border-border bg-card p-5">
-            <div className="flex items-center justify-between gap-4"><div><h2 className="font-semibold tracking-tight">Today&apos;s habits</h2><p className="mt-1 text-sm text-muted-foreground">Centang dari Habit Planner; automatic rules menyusul.</p></div><span className="font-mono text-sm text-muted-foreground">{habitDone}/{habitList.length}</span></div>
+            <div className="flex items-center justify-between gap-4"><div><h2 className="font-semibold tracking-tight">Today&apos;s habits</h2><p className="mt-1 text-sm text-muted-foreground">Manual check dan automation Timeline/StayFree memakai hasil yang sama.</p></div><span className="font-mono text-sm text-muted-foreground">{habitDone}/{habitList.length}</span></div>
             <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
               {habitList.slice(0, 10).map((habit) => {
                 const done = checkedToday.has(habit.id);
-                return <div key={habit.id} className="flex items-center gap-3 rounded-lg border border-border px-3 py-2.5"><span className={`grid size-5 place-items-center rounded-md border ${done ? "border-transparent text-white" : "border-border"}`} style={done ? { background: habit.color } : undefined}>{done ? <CheckCircle2 className="size-3.5" /> : null}</span><span className="size-2 rounded-full" style={{ background: habit.color }} /><span className="text-sm">{habit.name}</span></div>;
+                const check = todayCheckMap.get(habit.id);
+                const automatic = check?.source === "time_rule" || check?.source === "stayfree_rule";
+                return <div key={habit.id} className="flex items-center gap-3 rounded-lg border border-border px-3 py-2.5"><span className={`grid size-5 place-items-center rounded-md border ${done ? "border-transparent text-white" : "border-border"}`} style={done ? { background: habit.color } : undefined}>{done ? <CheckCircle2 className="size-3.5" /> : null}</span><span className="size-2 rounded-full" style={{ background: habit.color }} /><span className="min-w-0 flex-1 truncate text-sm">{habit.name}</span>{automatic ? <span title="Completed by automation" className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] font-semibold text-primary"><Zap className="size-2.5" /> AUTO</span> : null}</div>;
               })}
             </div>
             <Link href="/habits" className="mt-4 inline-flex text-sm font-medium text-primary hover:underline">Open habits →</Link>
           </article>
 
           <article className="rounded-xl border border-border bg-card p-5">
-            <div className="flex items-center justify-between gap-4"><div><h2 className="font-semibold tracking-tight">Digital usage</h2><p className="mt-1 text-sm text-muted-foreground">Akan terisi setelah StayFree CSV importer aktif.</p></div><span className="font-mono text-sm text-muted-foreground">{formatDuration(Math.round(totalScreenSeconds / 60))}</span></div>
+            <div className="flex items-center justify-between gap-4"><div><h2 className="font-semibold tracking-tight">Digital usage</h2><p className="mt-1 text-sm text-muted-foreground">Dari StayFree CSV importer di Settings.</p></div><span className="font-mono text-sm text-muted-foreground">{formatDuration(Math.round(totalScreenSeconds / 60))}</span></div>
             <div className="mt-4 divide-y divide-border">
               {topApps.length ? topApps.map(([name, seconds]) => <div key={name} className="flex items-center justify-between py-2.5 text-sm"><span>{name}</span><span className="font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(Math.round(seconds / 60))}</span></div>) : <p className="py-4 text-sm text-muted-foreground">Belum ada data screen usage.</p>}
             </div>

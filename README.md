@@ -134,3 +134,7 @@ git add .
 git commit -m "feat: connect tracker to real Supabase data"
 git push
 ```
+
+## Real Data V2
+
+`REAL_DATA_V2.md` documents the automation + StayFree batch. Hosted Supabase migrations are mirrored in `supabase/migrations/` and the frontend can be deployed with the normal Git workflow after `npm.cmd run build` succeeds.
