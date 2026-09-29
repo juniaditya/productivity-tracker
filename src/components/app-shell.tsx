@@ -12,6 +12,7 @@ import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { APP_NAME } from "@/lib/constants";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { SignOutButton } from "@/components/sign-out-button";
 
 const items = [
   { href: "/", label: "Today", icon: LayoutDashboard },
@@ -57,6 +58,7 @@ export function AppShell({ children }: { children: ReactNode }) {
 
         <div className="mt-auto border-t border-border pt-4">
           <ThemeToggle />
+          <SignOutButton />
           <p className="mt-3 px-1 text-xs leading-relaxed text-muted-foreground">
             15-minute timeline · habits · digital usage
           </p>

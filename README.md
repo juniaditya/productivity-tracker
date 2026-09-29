@@ -106,3 +106,31 @@ Automatic habit rules are optional and designed for:
 - StayFree usage limits (`Phone <= 120 min`, finalized at day end)
 
 Manual overrides remain possible.
+
+## Real-data v1
+
+The app now uses Supabase data for the core workflow instead of demo arrays:
+
+- Timeline loads/saves `time_blocks` by date at 15-minute resolution.
+- Saving one Timeline day uses `save_day_time_blocks()` so delete + insert happen atomically.
+- Settings manages real `categories` (add, rename, recolor, classify, archive/restore).
+- Habits manages real `habits` and `habit_checks` (add, edit, archive, monthly navigation, daily checks).
+- Today reads real Timeline, habit, and screen-usage records.
+- Insights calculates seven-day coverage, category classifications, habit completion, and screen-time average from real rows.
+- `ensure_personal_defaults()` idempotently creates default categories/habits for an authenticated account.
+
+Database migrations applied to the hosted Supabase project are mirrored under `supabase/migrations/`.
+
+### Before pushing
+
+```powershell
+npm.cmd run build
+```
+
+Then:
+
+```powershell
+git add .
+git commit -m "feat: connect tracker to real Supabase data"
+git push
+```
