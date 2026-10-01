@@ -1,4 +1,4 @@
-import { Activity, CheckCircle2, Clock3, Smartphone, Zap } from "lucide-react";
+import { Activity, CheckCircle2, Clock3, Smartphone, Trophy, Zap } from "lucide-react";
 import Link from "next/link";
 import { LiveDataBadge } from "@/components/live-data-badge";
 import { PageHeader } from "@/components/page-header";
@@ -6,8 +6,9 @@ import { Progress } from "@/components/progress";
 import { StatCard } from "@/components/stat-card";
 import { dateKeyInTimeZone, formatDateKey, weekRange } from "@/lib/date";
 import { formatDuration } from "@/lib/format";
+import { milestoneCatalog } from "@/lib/milestones";
 import { createClient } from "@/lib/supabase/server";
-import type { Category, Habit, HabitCheck, ScreenUsage, TimeBlock } from "@/lib/types";
+import type { Category, Habit, HabitCheck, MilestoneUnlock, ScreenUsage, TimeBlock } from "@/lib/types";
 
 function clockCoverage(blocks: TimeBlock[]) {
   const slots = new Set<number>();
@@ -20,7 +21,7 @@ function clockCoverage(blocks: TimeBlock[]) {
 export default async function TodayPage() {
   const supabase = await createClient();
   const [{ data: settings }, { data: categories }, { data: habits }] = await Promise.all([
-    supabase.from("user_settings").select("timezone").maybeSingle(),
+    supabase.from("user_settings").select("timezone,gamification_enabled").maybeSingle(),
     supabase.from("categories").select("id,user_id,name,color,classification,sort_order,is_active").eq("is_active", true).order("sort_order"),
     supabase.from("habits").select("id,user_id,name,color,completion_mode,weekly_target,monthly_target,sort_order,is_active").eq("is_active", true).order("sort_order"),
   ]);
@@ -30,12 +31,14 @@ export default async function TodayPage() {
   const week = weekRange(today);
 
   await supabase.rpc("evaluate_habit_rules", { p_check_date: today });
+  await supabase.rpc("refresh_milestones");
 
-  const [blocksResult, todayChecksResult, weekChecksResult, screenResult] = await Promise.all([
+  const [blocksResult, todayChecksResult, weekChecksResult, screenResult, milestonesResult] = await Promise.all([
     supabase.from("time_blocks").select("id,activity_date,start_minute,end_minute,category_id,note,source").eq("activity_date", today).order("start_minute"),
     supabase.from("habit_checks").select("id,habit_id,check_date,checked,source,note").eq("check_date", today).eq("checked", true),
     supabase.from("habit_checks").select("id,habit_id,check_date,checked,source,note").gte("check_date", week.start).lte("check_date", week.end).eq("checked", true),
     supabase.from("screen_usage").select("usage_date,device,app_name,domain,duration_seconds").eq("usage_date", today),
+    supabase.from("milestone_unlocks").select("id,user_id,milestone_key,unlocked_at,metadata").order("unlocked_at", { ascending: false }).limit(3),
   ]);
 
   const blocks = (blocksResult.data ?? []) as TimeBlock[];
@@ -44,6 +47,7 @@ export default async function TodayPage() {
   const todayChecks = (todayChecksResult.data ?? []) as HabitCheck[];
   const weekChecks = (weekChecksResult.data ?? []) as HabitCheck[];
   const screenUsage = (screenResult.data ?? []) as ScreenUsage[];
+  const milestones = (milestonesResult.data ?? []) as MilestoneUnlock[];
 
   const tracked = clockCoverage(blocks);
   const coverage = Math.round((tracked / 1440) * 100);
@@ -132,6 +136,17 @@ export default async function TodayPage() {
           </article>
         </div>
       </section>
+      {settings?.gamification_enabled && milestones.length ? (
+        <section className="mt-6 rounded-xl border border-border bg-card p-5">
+          <div className="flex items-center justify-between gap-4"><div><h2 className="flex items-center gap-2 font-semibold"><Trophy className="size-4 text-amber-500" /> Milestones</h2><p className="mt-1 text-sm text-muted-foreground">Gamification ringan: hanya achievement yang benar-benar berasal dari data Anda, tanpa streak penalty.</p></div><span className="font-mono text-xs text-muted-foreground">{milestones.length} recent</span></div>
+          <div className="mt-4 grid gap-3 md:grid-cols-3">
+            {milestones.map((milestone) => {
+              const info = milestoneCatalog[milestone.milestone_key] ?? { title: milestone.milestone_key, description: "Milestone unlocked." };
+              return <div key={milestone.id} className="rounded-lg border border-border p-4"><p className="text-sm font-semibold">{info.title}</p><p className="mt-1 text-xs leading-5 text-muted-foreground">{info.description}</p><p className="mt-3 font-mono text-[10px] text-muted-foreground">{new Intl.DateTimeFormat("id-ID", { dateStyle: "medium" }).format(new Date(milestone.unlocked_at))}</p></div>;
+            })}
+          </div>
+        </section>
+      ) : null}
     </div>
   );
 }

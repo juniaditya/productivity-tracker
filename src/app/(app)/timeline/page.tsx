@@ -14,7 +14,7 @@ export default async function TimelinePage() {
   const today = dateKeyInTimeZone(new Date(), settings?.timezone ?? "Asia/Makassar");
   const { data: blocks } = await supabase
     .from("time_blocks")
-    .select("id,activity_date,start_minute,end_minute,category_id,note,source")
+    .select("id,activity_date,start_minute,end_minute,category_id,note,source,external_id,external_calendar_id")
     .eq("activity_date", today)
     .order("start_minute");
 

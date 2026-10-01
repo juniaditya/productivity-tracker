@@ -19,6 +19,11 @@ import type { Category, TimeBlock } from "@/lib/types";
 type Mode = "paint" | "erase" | "select";
 type SlotMap = Record<number, string[]>;
 type NoteMap = Record<string, string>;
+type MetaMap = Record<string, {
+  source: string;
+  external_id: string | null;
+  external_calendar_id: string | null;
+}>;
 
 type Props = {
   initialDate: string;
@@ -29,6 +34,7 @@ type Props = {
 function blockState(blocks: TimeBlock[]) {
   const slots: SlotMap = {};
   const notes: NoteMap = {};
+  const meta: MetaMap = {};
   for (const block of blocks) {
     for (let minute = block.start_minute; minute < block.end_minute; minute += 15) {
       const slot = minute / 15;
@@ -36,33 +42,73 @@ function blockState(blocks: TimeBlock[]) {
       if (!entries.includes(block.category_id) && entries.length < 2) {
         slots[slot] = [...entries, block.category_id];
       }
-      if (block.note) notes[`${slot}:${block.category_id}`] = block.note;
+      const key = `${slot}:${block.category_id}`;
+      if (block.note) notes[key] = block.note;
+      meta[key] = {
+        source: block.source ?? "manual",
+        external_id: block.external_id ?? null,
+        external_calendar_id: block.external_calendar_id ?? null,
+      };
     }
   }
-  return { slots, notes };
+  return { slots, notes, meta };
 }
 
-function slotsToBlocks(slots: SlotMap, notes: NoteMap, date: string) {
+function metaSignature(value?: MetaMap[string]) {
+  if (!value) return "manual||";
+  return `${value.source || "manual"}|${value.external_calendar_id ?? ""}|${value.external_id ?? ""}`;
+}
+
+function slotsToBlocks(slots: SlotMap, notes: NoteMap, meta: MetaMap, date: string) {
   const categoryIds = Array.from(new Set(Object.values(slots).flat()));
   const blocks: Array<Omit<TimeBlock, "id">> = [];
 
   for (const categoryId of categoryIds) {
     let start: number | null = null;
     let currentNote = "";
+    let currentMeta: MetaMap[string] | undefined;
+    let currentSignature = "manual||";
     for (let slot = 0; slot <= 96; slot++) {
       const active = slot < 96 && (slots[slot] ?? []).includes(categoryId);
-      const note = active ? (notes[`${slot}:${categoryId}`] ?? "") : "";
+      const key = `${slot}:${categoryId}`;
+      const note = active ? (notes[key] ?? "") : "";
+      const slotMeta = active ? meta[key] : undefined;
+      const signature = active ? metaSignature(slotMeta) : "";
       if (active && start === null) {
         start = slot * 15;
         currentNote = note;
-      } else if (active && start !== null && note !== currentNote) {
-        blocks.push({ activity_date: date, start_minute: start, end_minute: slot * 15, category_id: categoryId, note: currentNote || null, source: "manual" });
+        currentMeta = slotMeta;
+        currentSignature = signature;
+      } else if (active && start !== null && (note !== currentNote || signature !== currentSignature)) {
+        blocks.push({
+          activity_date: date,
+          start_minute: start,
+          end_minute: slot * 15,
+          category_id: categoryId,
+          note: currentNote || null,
+          source: currentMeta?.source ?? "manual",
+          external_id: currentMeta?.external_id ?? null,
+          external_calendar_id: currentMeta?.external_calendar_id ?? null,
+        });
         start = slot * 15;
         currentNote = note;
+        currentMeta = slotMeta;
+        currentSignature = signature;
       } else if (!active && start !== null) {
-        blocks.push({ activity_date: date, start_minute: start, end_minute: slot * 15, category_id: categoryId, note: currentNote || null, source: "manual" });
+        blocks.push({
+          activity_date: date,
+          start_minute: start,
+          end_minute: slot * 15,
+          category_id: categoryId,
+          note: currentNote || null,
+          source: currentMeta?.source ?? "manual",
+          external_id: currentMeta?.external_id ?? null,
+          external_calendar_id: currentMeta?.external_calendar_id ?? null,
+        });
         start = null;
         currentNote = "";
+        currentMeta = undefined;
+        currentSignature = "manual||";
       }
     }
   }
@@ -78,6 +124,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
   const [cursor, setCursor] = useState(initialDate);
   const [slots, setSlots] = useState<SlotMap>(() => initialState.slots);
   const [notes, setNotes] = useState<NoteMap>(() => initialState.notes);
+  const [meta, setMeta] = useState<MetaMap>(() => initialState.meta);
   const [focusedSlot, setFocusedSlot] = useState<number | null>(null);
   const [selected, setSelected] = useState(activeCategories[0]?.id ?? "");
   const [mode, setMode] = useState<Mode>("paint");
@@ -137,13 +184,31 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
       return next;
     });
     if (!changed) return;
+    const key = `${slot}:${selected}`;
     if (mode === "erase") {
       setNotes((currentNotes) => {
         const nextNotes = { ...currentNotes };
-        delete nextNotes[`${slot}:${selected}`];
+        delete nextNotes[key];
         return nextNotes;
       });
     }
+    // Editing any part of an imported Calendar run converts that whole run to manual.
+    // This prevents one Google event ID from being split into multiple database rows.
+    setMeta((currentMeta) => {
+      const nextMeta = { ...currentMeta };
+      const sourceMeta = currentMeta[key];
+      if (!sourceMeta) {
+        delete nextMeta[key];
+        return nextMeta;
+      }
+      const signature = metaSignature(sourceMeta);
+      let left = slot;
+      let right = slot;
+      while (left > 0 && metaSignature(currentMeta[`${left - 1}:${selected}`]) === signature) left--;
+      while (right < 95 && metaSignature(currentMeta[`${right + 1}:${selected}`]) === signature) right++;
+      for (let index = left; index <= right; index++) delete nextMeta[`${index}:${selected}`];
+      return nextMeta;
+    });
     markChanged();
   }
 
@@ -156,11 +221,14 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     if (!silent) setMessage(null);
 
     const supabase = createClient();
-    const blocks = slotsToBlocks(slots, notes, cursor).map((block) => ({
+    const blocks = slotsToBlocks(slots, notes, meta, cursor).map((block) => ({
       start_minute: block.start_minute,
       end_minute: block.end_minute,
       category_id: block.category_id,
       note: block.note,
+      source: block.source ?? "manual",
+      external_id: block.external_id ?? null,
+      external_calendar_id: block.external_calendar_id ?? null,
     }));
     const { error: saveError } = await supabase.rpc("save_day_time_blocks", {
       p_activity_date: cursor,
@@ -176,7 +244,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     if (mutationVersion.current === versionAtStart) setDirty(false);
     setMessage(silent ? "Autosaved" : "Tersimpan ke Supabase");
     return true;
-  }, [cursor, notes, slots]);
+  }, [cursor, meta, notes, slots]);
 
   useEffect(() => {
     if (!dirty || loading || saving) return;
@@ -197,7 +265,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     const supabase = createClient();
     const { data, error: loadError } = await supabase
       .from("time_blocks")
-      .select("id,activity_date,start_minute,end_minute,category_id,note,source")
+      .select("id,activity_date,start_minute,end_minute,category_id,note,source,external_id,external_calendar_id")
       .eq("activity_date", nextDate)
       .order("start_minute");
     setLoading(false);
@@ -209,16 +277,26 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
     const nextState = blockState((data ?? []) as TimeBlock[]);
     setSlots(nextState.slots);
     setNotes(nextState.notes);
+    setMeta(nextState.meta);
     setFocusedSlot(null);
     mutationVersion.current = 0;
     setDirty(false);
   }
 
   function setRunNote(categoryId: string, slot: number, value: string) {
+    const signature = metaSignature(meta[`${slot}:${categoryId}`]);
     let left = slot;
     let right = slot;
-    while (left > 0 && (slots[left - 1] ?? []).includes(categoryId)) left--;
-    while (right < 95 && (slots[right + 1] ?? []).includes(categoryId)) right++;
+    while (
+      left > 0 &&
+      (slots[left - 1] ?? []).includes(categoryId) &&
+      metaSignature(meta[`${left - 1}:${categoryId}`]) === signature
+    ) left--;
+    while (
+      right < 95 &&
+      (slots[right + 1] ?? []).includes(categoryId) &&
+      metaSignature(meta[`${right + 1}:${categoryId}`]) === signature
+    ) right++;
     setNotes((current) => {
       const next = { ...current };
       for (let index = left; index <= right; index++) {
@@ -318,7 +396,7 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
                 {(slots[focusedSlot] ?? []).length ? (slots[focusedSlot] ?? []).map((categoryId) => {
                   const category = categoryMap.get(categoryId);
                   if (!category) return null;
-                  return <label key={categoryId} className="block text-xs font-medium"><span className="mb-1.5 flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span><textarea value={notes[`${focusedSlot}:${categoryId}`] ?? ""} onChange={(event) => setRunNote(categoryId, focusedSlot, event.target.value)} rows={3} maxLength={500} placeholder="Catatan opsional untuk block ini…" className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm font-normal outline-none focus:border-primary" /></label>;
+                  return <label key={categoryId} className="block text-xs font-medium"><span className="mb-1.5 flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}{meta[`${focusedSlot}:${categoryId}`]?.source === "google_calendar" ? <span className="rounded-full bg-sky-500/10 px-1.5 py-0.5 text-[9px] font-semibold text-sky-700 dark:text-sky-300">CAL</span> : null}</span><textarea value={notes[`${focusedSlot}:${categoryId}`] ?? ""} onChange={(event) => setRunNote(categoryId, focusedSlot, event.target.value)} rows={3} maxLength={500} placeholder="Catatan opsional untuk block ini…" className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm font-normal outline-none focus:border-primary" /></label>;
                 }) : <p className="text-sm text-muted-foreground">Slot ini kosong. Pilih slot berwarna untuk memberi catatan.</p>}
               </div>
             </div>

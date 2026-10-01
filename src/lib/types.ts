@@ -23,6 +23,8 @@ export type TimeBlock = {
   category_id: string;
   note: string | null;
   source?: string;
+  external_id?: string | null;
+  external_calendar_id?: string | null;
 };
 
 export type Habit = {
@@ -83,4 +85,27 @@ export type ImportBatch = {
   file_name: string | null;
   row_count: number;
   imported_at: string;
+};
+
+export type UserSettings = {
+  user_id: string;
+  timezone: string;
+  day_cutoff: string;
+  gamification_enabled: boolean;
+};
+
+export type CalendarPreference = {
+  user_id: string;
+  import_calendar_id: string | null;
+  export_calendar_id: string | null;
+  import_category_id: string | null;
+  skip_all_day: boolean;
+};
+
+export type MilestoneUnlock = {
+  id: string;
+  user_id: string;
+  milestone_key: string;
+  unlocked_at: string;
+  metadata: Record<string, unknown>;
 };
