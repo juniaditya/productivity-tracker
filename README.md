@@ -71,3 +71,7 @@ Legacy external-integration tables remain in hosted Supabase for non-destructive
 ## V4
 
 See `REAL_DATA_V4.md` for the manual-only, navigation-performance, Timeline-reliability, and habit-ordering revision.
+
+## Timeline V5
+
+Timeline now uses draggable calendar-style activity blocks. Desktop defaults to a 7-day week, mobile to one day. Blocks support title/category/date/time/note editing, drag move, resize, duplicate/delete, 15-minute snapping, and atomic multi-day saves.

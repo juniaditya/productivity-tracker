@@ -21,6 +21,7 @@ export type TimeBlock = {
   start_minute: number;
   end_minute: number;
   category_id: string;
+  title: string | null;
   note: string | null;
   source?: string;
 };

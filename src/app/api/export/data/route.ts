@@ -25,7 +25,7 @@ export async function GET() {
     const entries = await Promise.all(tables.map(async (table) => [table, await readAll(supabase, table)] as const));
     const payload = {
       format: "focus-ledger-backup",
-      version: 4,
+      version: 5,
       mode: "manual-only",
       exported_at: new Date().toISOString(),
       user: { id: authData.user.id, email: authData.user.email ?? null },

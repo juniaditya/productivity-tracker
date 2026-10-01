@@ -26,6 +26,16 @@ export function formatDateKey(dateKey: string, options?: Intl.DateTimeFormatOpti
   }).format(new Date(`${dateKey}T12:00:00Z`));
 }
 
+
+export function sundayWeekRange(dateKey: string) {
+  const date = new Date(`${dateKey}T12:00:00Z`);
+  const day = date.getUTCDay();
+  return {
+    start: shiftDateKey(dateKey, -day),
+    end: shiftDateKey(dateKey, 6 - day),
+  };
+}
+
 export function weekRange(dateKey: string) {
   const date = new Date(`${dateKey}T12:00:00Z`);
   const day = date.getUTCDay();

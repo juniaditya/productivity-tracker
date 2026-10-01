@@ -1,0 +1,1900 @@
+diff --git a/README.md b/README.md
+index f8a76c7..7b0e5c9 100644
+--- a/README.md
++++ b/README.md
+@@ -71,3 +71,7 @@ Legacy external-integration tables remain in hosted Supabase for non-destructive
+ ## V4
+ 
+ See `REAL_DATA_V4.md` for the manual-only, navigation-performance, Timeline-reliability, and habit-ordering revision.
++
++## Timeline V5
++
++Timeline now uses draggable calendar-style activity blocks. Desktop defaults to a 7-day week, mobile to one day. Blocks support title/category/date/time/note editing, drag move, resize, duplicate/delete, 15-minute snapping, and atomic multi-day saves.
+diff --git a/REAL_DATA_V5.md b/REAL_DATA_V5.md
+new file mode 100644
+index 0000000..6291b01
+--- /dev/null
++++ b/REAL_DATA_V5.md
+@@ -0,0 +1,32 @@
++# Timeline V5 — Calendar Blocks
++
++V5 focuses the product on the manual Timeline experience.
++
++## Interaction
++
++- Desktop defaults to a 7-day Sunday–Saturday week view.
++- Mobile defaults to a single-day view.
++- Week / Day can still be toggled manually.
++- Click-drag empty calendar space to create an activity block.
++- Drag a block vertically to move its time and horizontally to move it to another visible day.
++- Drag the top/bottom edge to resize start/end time.
++- All interactions snap to 15 minutes.
++- Maximum two overlapping activities remains enforced in both UI and Postgres.
++
++## Block detail
++
++Each Timeline block now stores:
++
++- title
++- category
++- date
++- start / end time
++- note
++
++Clicking a block opens an editor with Save, Delete, Duplicate, category, date, time, title, and note controls.
++
++## Saving
++
++V5 adds `save_timeline_days(jsonb)` so multiple dirty dates are saved in one database transaction. This matters when a drag moves a block from one day to another: the source and destination day are committed together.
++
++Autosave remains enabled and menu navigation waits for the save queue to finish before leaving Timeline.
+diff --git a/src/app/(app)/timeline/page.tsx b/src/app/(app)/timeline/page.tsx
+index 90e64c2..f9dc70b 100644
+--- a/src/app/(app)/timeline/page.tsx
++++ b/src/app/(app)/timeline/page.tsx
+@@ -1,7 +1,7 @@
+ import { LiveDataBadge } from "@/components/live-data-badge";
+ import { PageHeader } from "@/components/page-header";
+ import { TimelineEditor } from "@/components/timeline-editor";
+-import { dateKeyInTimeZone } from "@/lib/date";
++import { dateKeyInTimeZone, sundayWeekRange } from "@/lib/date";
+ import { createClient } from "@/lib/supabase/server";
+ import type { Category, TimeBlock } from "@/lib/types";
+ 
+@@ -11,13 +11,35 @@ export default async function TimelinePage() {
+     supabase.from("user_settings").select("timezone").maybeSingle(),
+     supabase.from("categories").select("id,user_id,name,color,classification,sort_order,is_active").order("sort_order"),
+   ]);
+-  const today = dateKeyInTimeZone(new Date(), settings?.timezone ?? "Asia/Makassar");
+-  const { data: blocks } = await supabase.from("time_blocks").select("id,activity_date,start_minute,end_minute,category_id,note,source").eq("activity_date", today).order("start_minute");
++
++  const timezone = settings?.timezone ?? "Asia/Makassar";
++  const today = dateKeyInTimeZone(new Date(), timezone);
++  const range = sundayWeekRange(today);
++  const { data: blocks } = await supabase
++    .from("time_blocks")
++    .select("id,activity_date,start_minute,end_minute,category_id,title,note,source")
++    .gte("activity_date", range.start)
++    .lte("activity_date", range.end)
++    .order("activity_date")
++    .order("start_minute");
+ 
+   return (
+-    <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+-      <PageHeader eyebrow="Timeline" title="Where did the day go?" description="Isi aktivitas manual dalam resolusi 15 menit. Save diperketat agar perpindahan tanggal/menu tidak membuang perubahan terakhir." action={<LiveDataBadge />} />
+-      <div className="mt-6"><TimelineEditor initialDate={today} initialCategories={(categories ?? []) as Category[]} initialBlocks={(blocks ?? []) as TimeBlock[]} /></div>
++    <div className="mx-auto max-w-[1600px] px-2 py-4 sm:px-4 lg:px-6 lg:py-6">
++      <PageHeader
++        eyebrow="Timeline"
++        title="Calendar-style time ledger"
++        description="Desktop default 7 hari, HP default 1 hari. Drag untuk pindah, tarik tepi atas/bawah untuk resize, klik block untuk edit detail. Semua waktu tetap snap 15 menit."
++        action={<LiveDataBadge />}
++      />
++      <div className="mt-4">
++        <TimelineEditor
++          initialDate={today}
++          initialRangeStart={range.start}
++          timezone={timezone}
++          initialCategories={(categories ?? []) as Category[]}
++          initialBlocks={(blocks ?? []) as TimeBlock[]}
++        />
++      </div>
+     </div>
+   );
+ }
+diff --git a/src/app/api/export/data/route.ts b/src/app/api/export/data/route.ts
+index 71bfa1c..e9d55ac 100644
+--- a/src/app/api/export/data/route.ts
++++ b/src/app/api/export/data/route.ts
+@@ -25,7 +25,7 @@ export async function GET() {
+     const entries = await Promise.all(tables.map(async (table) => [table, await readAll(supabase, table)] as const));
+     const payload = {
+       format: "focus-ledger-backup",
+-      version: 4,
++      version: 5,
+       mode: "manual-only",
+       exported_at: new Date().toISOString(),
+       user: { id: authData.user.id, email: authData.user.email ?? null },
+diff --git a/src/app/api/timeline/save/route.ts b/src/app/api/timeline/save/route.ts
+index 7506b5c..768126f 100644
+--- a/src/app/api/timeline/save/route.ts
++++ b/src/app/api/timeline/save/route.ts
+@@ -1,24 +1,40 @@
+ import { NextRequest, NextResponse } from "next/server";
+ import { createClient } from "@/lib/supabase/server";
+ 
++type TimelineDay = {
++  activity_date?: string;
++  blocks?: unknown[];
++};
++
+ export async function POST(request: NextRequest) {
+   const supabase = await createClient();
+   const { data: authData } = await supabase.auth.getUser();
+   if (!authData.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+ 
+   try {
+-    const body = await request.json() as { date?: string; blocks?: unknown[] };
+-    if (!body.date || !Array.isArray(body.blocks)) {
++    const body = await request.json() as {
++      days?: TimelineDay[];
++      date?: string;
++      blocks?: unknown[];
++    };
++
++    const days = Array.isArray(body.days)
++      ? body.days
++      : body.date && Array.isArray(body.blocks)
++        ? [{ activity_date: body.date, blocks: body.blocks }]
++        : null;
++
++    if (!days?.length || days.some((day) => !day.activity_date || !Array.isArray(day.blocks))) {
+       return NextResponse.json({ error: "Invalid Timeline payload." }, { status: 400 });
+     }
+ 
+-    const { error } = await supabase.rpc("save_day_time_blocks", {
+-      p_activity_date: body.date,
+-      p_blocks: body.blocks,
+-    });
++    const { error } = await supabase.rpc("save_timeline_days", { p_days: days });
+     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
+-    return NextResponse.json({ ok: true });
++    return NextResponse.json({ ok: true, saved_days: days.length });
+   } catch (error) {
+-    return NextResponse.json({ error: error instanceof Error ? error.message : "Timeline save failed." }, { status: 500 });
++    return NextResponse.json(
++      { error: error instanceof Error ? error.message : "Timeline save failed." },
++      { status: 500 },
++    );
+   }
+ }
+diff --git a/src/components/timeline-editor.tsx b/src/components/timeline-editor.tsx
+index bdcab2b..cf0c63a 100644
+--- a/src/components/timeline-editor.tsx
++++ b/src/components/timeline-editor.tsx
+@@ -1,214 +1,406 @@
+ "use client";
+ 
+ import {
++  CalendarDays,
+   CheckCircle2,
+   ChevronLeft,
+   ChevronRight,
+-  Eraser,
++  Clock3,
+   Loader2,
+-  MousePointer2,
+-  Paintbrush,
++  Plus,
+   Save,
++  Trash2,
++  X,
+ } from "lucide-react";
+ import { useRouter } from "next/navigation";
+-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+-import { formatDateKey, shiftDateKey } from "@/lib/date";
++import {
++  type PointerEvent as ReactPointerEvent,
++  useCallback,
++  useEffect,
++  useMemo,
++  useRef,
++  useState,
++} from "react";
++import {
++  dateKeyInTimeZone,
++  formatDateKey,
++  shiftDateKey,
++  sundayWeekRange,
++} from "@/lib/date";
+ import { formatDuration, minuteLabel } from "@/lib/format";
+ import { createClient } from "@/lib/supabase/client";
+ import type { Category, TimeBlock } from "@/lib/types";
+ 
+-type Mode = "paint" | "erase" | "select";
+-type SlotMap = Record<number, string[]>;
+-type NoteMap = Record<string, string>;
++type ViewMode = "week" | "day";
++
++type CalendarBlock = TimeBlock & {
++  client_id: string;
++};
++
++type EditorDraft = {
++  client_id: string;
++  activity_date: string;
++  start_minute: number;
++  end_minute: number;
++  category_id: string;
++  title: string;
++  note: string;
++};
++
++type Interaction =
++  | {
++      type: "create";
++      pointerId: number;
++      blockId: string;
++      anchorMinute: number;
++      original: CalendarBlock;
++      moved: boolean;
++    }
++  | {
++      type: "move";
++      pointerId: number;
++      blockId: string;
++      original: CalendarBlock;
++      startClientX: number;
++      startClientY: number;
++      moved: boolean;
++    }
++  | {
++      type: "resize-start" | "resize-end";
++      pointerId: number;
++      blockId: string;
++      original: CalendarBlock;
++      moved: boolean;
++    };
++
++type SavePayloadDay = {
++  activity_date: string;
++  blocks: Array<{
++    start_minute: number;
++    end_minute: number;
++    category_id: string;
++    title: string | null;
++    note: string | null;
++  }>;
++};
+ 
+ type Props = {
+   initialDate: string;
++  initialRangeStart: string;
++  timezone: string;
+   initialCategories: Category[];
+   initialBlocks: TimeBlock[];
+ };
+ 
+-type SaveSnapshot = {
+-  date: string;
+-  slots: SlotMap;
+-  notes: NoteMap;
+-  version: number;
+-};
++const HOUR_HEIGHT = 64;
++const DAY_HEIGHT = HOUR_HEIGHT * 24;
++const MINUTE_PX = HOUR_HEIGHT / 60;
++const SNAP = 15;
++const MIN_DURATION = 15;
+ 
+-function blockState(blocks: TimeBlock[]) {
+-  const slots: SlotMap = {};
+-  const notes: NoteMap = {};
+-  for (const block of blocks) {
+-    for (let minute = block.start_minute; minute < block.end_minute; minute += 15) {
+-      const slot = minute / 15;
+-      const entries = slots[slot] ?? [];
+-      if (!entries.includes(block.category_id) && entries.length < 2) slots[slot] = [...entries, block.category_id];
+-      if (block.note) notes[`${slot}:${block.category_id}`] = block.note;
+-    }
++function makeClientId(block?: TimeBlock) {
++  if (block?.id) return `db:${block.id}`;
++  return `local:${Date.now().toString(36)}:${Math.random().toString(36).slice(2)}`;
++}
++
++function hydrateBlocks(blocks: TimeBlock[]): CalendarBlock[] {
++  return blocks.map((block) => ({
++    ...block,
++    title: block.title ?? null,
++    client_id: makeClientId(block),
++  }));
++}
++
++function snapMinute(value: number) {
++  return Math.max(0, Math.min(1440, Math.round(value / SNAP) * SNAP));
++}
++
++function snapDelta(value: number) {
++  return Math.round(value / SNAP) * SNAP;
++}
++
++function clampBlockStart(value: number, duration: number) {
++  return Math.max(0, Math.min(1440 - duration, snapMinute(value)));
++}
++
++function minutesFromPointer(clientY: number, grid: HTMLElement) {
++  const rect = grid.getBoundingClientRect();
++  return snapMinute((clientY - rect.top) / MINUTE_PX);
++}
++
++function minuteToInput(minute: number) {
++  const safe = Math.max(0, Math.min(1439, minute));
++  const hours = Math.floor(safe / 60).toString().padStart(2, "0");
++  const minutes = (safe % 60).toString().padStart(2, "0");
++  return `${hours}:${minutes}`;
++}
++
++function inputToMinute(value: string) {
++  const [hours, minutes] = value.split(":").map(Number);
++  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
++  return snapMinute(hours * 60 + minutes);
++}
++
++function textColor(hex: string) {
++  const clean = hex.replace("#", "");
++  if (clean.length !== 6) return "#ffffff";
++  const r = Number.parseInt(clean.slice(0, 2), 16);
++  const g = Number.parseInt(clean.slice(2, 4), 16);
++  const b = Number.parseInt(clean.slice(4, 6), 16);
++  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
++  return luminance > 0.64 ? "#111827" : "#ffffff";
++}
++
++function overlaps(a: CalendarBlock, b: CalendarBlock) {
++  return a.activity_date === b.activity_date && a.start_minute < b.end_minute && a.end_minute > b.start_minute;
++}
++
++function canPlace(candidate: CalendarBlock, blocks: CalendarBlock[]) {
++  for (let minute = candidate.start_minute; minute < candidate.end_minute; minute += SNAP) {
++    const others = blocks.filter(
++      (block) =>
++        block.client_id !== candidate.client_id &&
++        block.activity_date === candidate.activity_date &&
++        block.start_minute <= minute &&
++        block.end_minute > minute,
++    );
++    if (others.length >= 2) return false;
+   }
+-  return { slots, notes };
++  return true;
+ }
+ 
+-function slotsToBlocks(slots: SlotMap, notes: NoteMap) {
+-  const categoryIds = Array.from(new Set(Object.values(slots).flat()));
+-  const blocks: Array<{ start_minute: number; end_minute: number; category_id: string; note: string | null; source: "manual" }> = [];
+-
+-  for (const categoryId of categoryIds) {
+-    let start: number | null = null;
+-    let currentNote = "";
+-    for (let slot = 0; slot <= 96; slot++) {
+-      const active = slot < 96 && (slots[slot] ?? []).includes(categoryId);
+-      const note = active ? (notes[`${slot}:${categoryId}`] ?? "") : "";
+-      if (active && start === null) {
+-        start = slot * 15;
+-        currentNote = note;
+-      } else if (active && start !== null && note !== currentNote) {
+-        blocks.push({ start_minute: start, end_minute: slot * 15, category_id: categoryId, note: currentNote || null, source: "manual" });
+-        start = slot * 15;
+-        currentNote = note;
+-      } else if (!active && start !== null) {
+-        blocks.push({ start_minute: start, end_minute: slot * 15, category_id: categoryId, note: currentNote || null, source: "manual" });
+-        start = null;
+-        currentNote = "";
+-      }
+-    }
++function dayLayout(blocks: CalendarBlock[]) {
++  const sorted = [...blocks].sort(
++    (a, b) => a.start_minute - b.start_minute || a.end_minute - b.end_minute,
++  );
++  const laneEnd = [-1, -1];
++  const layout = new Map<string, { lane: number; split: boolean }>();
++
++  for (const block of sorted) {
++    const lane = laneEnd[0] <= block.start_minute ? 0 : 1;
++    laneEnd[lane] = block.end_minute;
++    const split = sorted.some(
++      (other) => other.client_id !== block.client_id && overlaps(block, other),
++    );
++    layout.set(block.client_id, { lane, split });
+   }
+ 
+-  return blocks.sort((a, b) => a.start_minute - b.start_minute || a.category_id.localeCompare(b.category_id));
++  return layout;
++}
++
++function formatCompactDate(dateKey: string) {
++  return formatDateKey(dateKey, { weekday: "short", day: "numeric", month: "short" });
+ }
+ 
+-async function postSnapshot(snapshot: SaveSnapshot, keepalive = false) {
++function getCurrentMinute(timeZone: string) {
++  const parts = new Intl.DateTimeFormat("en-US", {
++    timeZone,
++    hour: "2-digit",
++    minute: "2-digit",
++    hourCycle: "h23",
++  }).formatToParts(new Date());
++  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
++  return Number(values.hour ?? 0) * 60 + Number(values.minute ?? 0);
++}
++
++async function postDays(days: SavePayloadDay[], keepalive = false) {
+   const response = await fetch("/api/timeline/save", {
+     method: "POST",
+     headers: { "content-type": "application/json" },
+     credentials: "same-origin",
+     keepalive,
+-    body: JSON.stringify({ date: snapshot.date, blocks: slotsToBlocks(snapshot.slots, snapshot.notes) }),
++    body: JSON.stringify({ days }),
+   });
+   const payload = await response.json().catch(() => ({}));
+   if (!response.ok) throw new Error(payload.error || "Timeline save failed.");
+ }
+ 
+-export function TimelineEditor({ initialDate, initialCategories, initialBlocks }: Props) {
++export function TimelineEditor({
++  initialDate,
++  initialRangeStart,
++  timezone,
++  initialCategories,
++  initialBlocks,
++}: Props) {
+   const router = useRouter();
+-  const categories = initialCategories;
+-  const activeCategories = useMemo(() => categories.filter((category) => category.is_active), [categories]);
+-  const categoryMap = useMemo(() => new Map(categories.map((category) => [category.id, category])), [categories]);
+-  const initialState = useMemo(() => blockState(initialBlocks), [initialBlocks]);
+-  const [cursor, setCursor] = useState(initialDate);
+-  const [slots, setSlots] = useState<SlotMap>(() => initialState.slots);
+-  const [notes, setNotes] = useState<NoteMap>(() => initialState.notes);
+-  const [focusedSlot, setFocusedSlot] = useState<number | null>(null);
+-  const [selected, setSelected] = useState(activeCategories[0]?.id ?? "");
+-  const [mode, setMode] = useState<Mode>("paint");
+-  const [dirty, setDirty] = useState(false);
++  const activeCategories = useMemo(
++    () => initialCategories.filter((category) => category.is_active),
++    [initialCategories],
++  );
++  const categoryMap = useMemo(
++    () => new Map(initialCategories.map((category) => [category.id, category])),
++    [initialCategories],
++  );
++
++  const [blocks, setBlocks] = useState<CalendarBlock[]>(() => hydrateBlocks(initialBlocks));
++  const blocksRef = useRef(blocks);
++  const [selectedDate, setSelectedDate] = useState(initialDate);
++  const [rangeStart, setRangeStart] = useState(initialRangeStart);
++  const [viewMode, setViewMode] = useState<ViewMode>("week");
++  const viewTouched = useRef(false);
++  const [selectedCategory, setSelectedCategory] = useState(activeCategories[0]?.id ?? "");
++  const [editingId, setEditingId] = useState<string | null>(null);
++  const [editorDraft, setEditorDraft] = useState<EditorDraft | null>(null);
+   const [loading, setLoading] = useState(false);
+   const [pendingSaves, setPendingSaves] = useState(0);
+   const [message, setMessage] = useState<string | null>(null);
+   const [error, setError] = useState<string | null>(null);
+-  const dragging = useRef(false);
+-  const mutationVersion = useRef(0);
++  const [dirtyDates, setDirtyDates] = useState<Set<string>>(() => new Set());
++  const dirtyDatesRef = useRef<Set<string>>(new Set());
++  const dateVersionsRef = useRef<Record<string, number>>({});
+   const saveChain = useRef<Promise<boolean>>(Promise.resolve(true));
+-  const latestSnapshot = useRef<SaveSnapshot>({ date: initialDate, slots: initialState.slots, notes: initialState.notes, version: 0 });
+-  const dirtyRef = useRef(false);
+-
+-  latestSnapshot.current = { date: cursor, slots, notes, version: mutationVersion.current };
+-  dirtyRef.current = dirty;
+-
+-  const totals = useMemo(() => {
+-    const map: Record<string, number> = {};
+-    Object.values(slots).forEach((entries) => entries.forEach((categoryId) => { map[categoryId] = (map[categoryId] ?? 0) + 15; }));
+-    return map;
+-  }, [slots]);
+-  const tracked = Object.values(slots).filter((entries) => entries.length > 0).length * 15;
+-
+-  function markChanged() {
+-    mutationVersion.current += 1;
+-    dirtyRef.current = true;
+-    setDirty(true);
+-    setMessage(null);
+-  }
++  const interactionRef = useRef<Interaction | null>(null);
++  const timelineGridRef = useRef<HTMLDivElement | null>(null);
++  const scrollRef = useRef<HTMLDivElement | null>(null);
++  const [clockTick, setClockTick] = useState(0);
++
++  blocksRef.current = blocks;
++  dirtyDatesRef.current = dirtyDates;
++
++  const rangeEnd = shiftDateKey(rangeStart, 6);
++  const weekDates = useMemo(
++    () => Array.from({ length: 7 }, (_, index) => shiftDateKey(rangeStart, index)),
++    [rangeStart],
++  );
++  const visibleDates = viewMode === "week" ? weekDates : [selectedDate];
++  const todayKey = dateKeyInTimeZone(new Date(), timezone);
++  const currentMinute = useMemo(() => getCurrentMinute(timezone), [timezone, clockTick]);
++  const busy = pendingSaves > 0;
++
++  const visibleBlocks = useMemo(
++    () => blocks.filter((block) => visibleDates.includes(block.activity_date)),
++    [blocks, visibleDates],
++  );
++
++  const dayTotals = useMemo(() => {
++    const totals = new Map<string, number>();
++    for (const block of blocks.filter((item) => item.activity_date === selectedDate)) {
++      totals.set(block.category_id, (totals.get(block.category_id) ?? 0) + block.end_minute - block.start_minute);
++    }
++    return totals;
++  }, [blocks, selectedDate]);
++
++  const selectedCoverage = useMemo(() => {
++    const occupied = new Set<number>();
++    for (const block of blocks.filter((item) => item.activity_date === selectedDate)) {
++      for (let minute = block.start_minute; minute < block.end_minute; minute += SNAP) occupied.add(minute);
++    }
++    return occupied.size * SNAP;
++  }, [blocks, selectedDate]);
++
++  useEffect(() => {
++    const media = window.matchMedia("(max-width: 767px)");
++    const apply = () => {
++      if (!viewTouched.current) setViewMode(media.matches ? "day" : "week");
++    };
++    apply();
++    media.addEventListener("change", apply);
++    return () => media.removeEventListener("change", apply);
++  }, []);
+ 
+-  function cellBackground(entries: string[]) {
+-    if (!entries.length) return "transparent";
+-    if (entries.length === 1) return categoryMap.get(entries[0])?.color ?? "#71717a";
+-    const c1 = categoryMap.get(entries[0])?.color ?? "#71717a";
+-    const c2 = categoryMap.get(entries[1])?.color ?? "#52525b";
+-    return `linear-gradient(135deg, ${c1} 0 50%, ${c2} 50% 100%)`;
++  useEffect(() => {
++    const timer = window.setInterval(() => setClockTick((value) => value + 1), 60_000);
++    return () => window.clearInterval(timer);
++  }, []);
++
++  useEffect(() => {
++    if (!scrollRef.current) return;
++    const targetMinute = visibleDates.includes(todayKey) ? Math.max(0, currentMinute - 120) : 240;
++    scrollRef.current.scrollTop = targetMinute * MINUTE_PX;
++    // Scroll only on the first calendar mount / range change, not every minute.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [rangeStart, viewMode]);
++
++  function setView(mode: ViewMode) {
++    viewTouched.current = true;
++    setViewMode(mode);
+   }
+ 
+-  function apply(slot: number) {
+-    if (mode === "select" || !selected) return;
+-    let changed = false;
+-    setSlots((current) => {
+-      const next = { ...current };
+-      const entries = [...(next[slot] ?? [])];
+-      if (mode === "paint") {
+-        if (!entries.includes(selected) && entries.length < 2) { entries.push(selected); changed = true; }
+-      } else {
+-        const index = entries.indexOf(selected);
+-        if (index >= 0) { entries.splice(index, 1); changed = true; }
++  function markDatesDirty(...dates: string[]) {
++    setMessage(null);
++    setDirtyDates((current) => {
++      const next = new Set(current);
++      for (const date of dates) {
++        next.add(date);
++        dateVersionsRef.current[date] = (dateVersionsRef.current[date] ?? 0) + 1;
+       }
+-      if (entries.length) next[slot] = entries;
+-      else delete next[slot];
++      dirtyDatesRef.current = next;
+       return next;
+     });
+-    if (!changed) return;
+-    if (mode === "erase") {
+-      setNotes((current) => {
+-        const next = { ...current };
+-        delete next[`${slot}:${selected}`];
+-        return next;
+-      });
+-    }
+-    markChanged();
+   }
+ 
+-  const queueSave = useCallback((silent = false, force = false) => {
+-    const snapshot: SaveSnapshot = {
+-      date: cursor,
+-      slots: structuredClone(slots),
+-      notes: structuredClone(notes),
+-      version: mutationVersion.current,
++  function serializeDate(date: string, sourceBlocks = blocksRef.current): SavePayloadDay {
++    return {
++      activity_date: date,
++      blocks: sourceBlocks
++        .filter((block) => block.activity_date === date)
++        .sort((a, b) => a.start_minute - b.start_minute || a.end_minute - b.end_minute)
++        .map((block) => ({
++          start_minute: block.start_minute,
++          end_minute: block.end_minute,
++          category_id: block.category_id,
++          title: block.title?.trim() || categoryMap.get(block.category_id)?.name || null,
++          note: block.note?.trim() || null,
++        })),
+     };
++  }
+ 
+-    if (!force && !dirtyRef.current) return saveChain.current;
++  const queueSave = useCallback(
++    (silent = false) => {
++      const dates = Array.from(dirtyDatesRef.current);
++      if (!dates.length) {
++        if (!silent) setMessage("Semua perubahan sudah tersimpan.");
++        return saveChain.current;
++      }
+ 
+-    setPendingSaves((value) => value + 1);
+-    setError(null);
+-    if (!silent) setMessage(null);
+-
+-    const task = saveChain.current.then(async () => {
+-      try {
+-        await postSnapshot(snapshot);
+-        if (mutationVersion.current === snapshot.version && cursor === snapshot.date) {
+-          setDirty(false);
+-          dirtyRef.current = false;
++      const blockSnapshot = blocksRef.current.map((block) => ({ ...block }));
++      const payload = dates.map((date) => serializeDate(date, blockSnapshot));
++      const versions = Object.fromEntries(dates.map((date) => [date, dateVersionsRef.current[date] ?? 0]));
++
++      setPendingSaves((value) => value + 1);
++      setError(null);
++      if (!silent) setMessage(null);
++
++      const task = saveChain.current.then(async () => {
++        try {
++          await postDays(payload);
++          setDirtyDates((current) => {
++            const next = new Set(current);
++            for (const date of dates) {
++              if ((dateVersionsRef.current[date] ?? 0) === versions[date]) next.delete(date);
++            }
++            dirtyDatesRef.current = next;
++            return next;
++          });
++          setMessage(silent ? "Autosaved" : "Tersimpan");
++          return true;
++        } catch (saveError) {
++          setError(saveError instanceof Error ? saveError.message : "Timeline save failed.");
++          return false;
++        } finally {
++          setPendingSaves((value) => Math.max(0, value - 1));
+         }
+-        setMessage(silent ? "Autosaved" : "Tersimpan");
+-        return true;
+-      } catch (saveError) {
+-        setError(saveError instanceof Error ? saveError.message : "Timeline save failed.");
+-        return false;
+-      } finally {
+-        setPendingSaves((value) => Math.max(0, value - 1));
+-      }
+-    });
++      });
+ 
+-    saveChain.current = task;
+-    return task;
+-  }, [cursor, notes, slots]);
++      saveChain.current = task;
++      return task;
++    },
++    // categoryMap only changes if Settings data changes after a navigation.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [categoryMap],
++  );
+ 
+   useEffect(() => {
+-    if (!dirty || loading) return;
+-    const timer = window.setTimeout(() => { void queueSave(true); }, 600);
++    if (!dirtyDates.size || loading) return;
++    const timer = window.setTimeout(() => void queueSave(true), 550);
+     return () => window.clearTimeout(timer);
+-  }, [dirty, loading, notes, queueSave, slots]);
++  }, [blocks, dirtyDates, loading, queueSave]);
+ 
+   useEffect(() => {
+     const navigate = async (event: Event) => {
+       const href = (event as CustomEvent<{ href?: string }>).detail?.href;
+       if (!href) return;
+-      const ok = dirtyRef.current ? await queueSave(true) : await saveChain.current;
++      const ok = dirtyDatesRef.current.size ? await queueSave(true) : await saveChain.current;
+       if (!ok) {
+         window.dispatchEvent(new Event("focus-ledger:navigation-cancelled"));
+         return;
+@@ -221,113 +413,731 @@ export function TimelineEditor({ initialDate, initialCategories, initialBlocks }
+ 
+   useEffect(() => {
+     const emergencySave = () => {
+-      if (!dirtyRef.current) return;
+-      void postSnapshot(latestSnapshot.current, true).catch(() => undefined);
++      const dates = Array.from(dirtyDatesRef.current);
++      if (!dates.length) return;
++      const payload = dates.map((date) => serializeDate(date, blocksRef.current));
++      void postDays(payload, true).catch(() => undefined);
+     };
+     window.addEventListener("pagehide", emergencySave);
+     window.addEventListener("beforeunload", emergencySave);
+     return () => {
+       window.removeEventListener("pagehide", emergencySave);
+       window.removeEventListener("beforeunload", emergencySave);
+-      emergencySave();
+     };
+-  }, []);
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [categoryMap]);
+ 
+-  async function loadDate(nextDate: string) {
+-    if (nextDate === cursor) return;
+-    const ok = dirtyRef.current ? await queueSave(true) : await saveChain.current;
+-    if (!ok) return;
++  async function fetchWeek(anchorDate: string) {
++    const ok = dirtyDatesRef.current.size ? await queueSave(true) : await saveChain.current;
++    if (!ok) return false;
+ 
++    const nextRange = sundayWeekRange(anchorDate);
+     setLoading(true);
+     setError(null);
+-    setMessage(null);
+     const supabase = createClient();
+     const { data, error: loadError } = await supabase
+       .from("time_blocks")
+-      .select("id,activity_date,start_minute,end_minute,category_id,note,source")
+-      .eq("activity_date", nextDate)
++      .select("id,activity_date,start_minute,end_minute,category_id,title,note,source")
++      .gte("activity_date", nextRange.start)
++      .lte("activity_date", nextRange.end)
++      .order("activity_date")
+       .order("start_minute");
+     setLoading(false);
+-    if (loadError) { setError(loadError.message); return; }
+-
+-    setCursor(nextDate);
+-    const nextState = blockState((data ?? []) as TimeBlock[]);
+-    setSlots(nextState.slots);
+-    setNotes(nextState.notes);
+-    setFocusedSlot(null);
+-    mutationVersion.current = 0;
+-    setDirty(false);
+-    dirtyRef.current = false;
++
++    if (loadError) {
++      setError(loadError.message);
++      return false;
++    }
++
++    setRangeStart(nextRange.start);
++    const nextBlocks = hydrateBlocks((data ?? []) as TimeBlock[]);
++    blocksRef.current = nextBlocks;
++    setBlocks(nextBlocks);
++    setDirtyDates(new Set());
++    dirtyDatesRef.current = new Set();
++    dateVersionsRef.current = {};
++    return true;
+   }
+ 
+-  function setRunNote(categoryId: string, slot: number, value: string) {
+-    let left = slot;
+-    let right = slot;
+-    while (left > 0 && (slots[left - 1] ?? []).includes(categoryId)) left--;
+-    while (right < 95 && (slots[right + 1] ?? []).includes(categoryId)) right++;
+-    setNotes((current) => {
+-      const next = { ...current };
+-      for (let index = left; index <= right; index++) {
+-        const key = `${index}:${categoryId}`;
+-        if (value.trim()) next[key] = value;
+-        else delete next[key];
+-      }
++  async function goToDate(date: string) {
++    const nextRange = sundayWeekRange(date);
++    if (nextRange.start !== rangeStart) {
++      const loaded = await fetchWeek(date);
++      if (!loaded) return;
++    } else if (dirtyDatesRef.current.size) {
++      const saved = await queueSave(true);
++      if (!saved) return;
++    }
++    setSelectedDate(date);
++  }
++
++  async function shiftVisible(direction: -1 | 1) {
++    if (viewMode === "day") {
++      await goToDate(shiftDateKey(selectedDate, direction));
++      return;
++    }
++    const nextDate = shiftDateKey(selectedDate, direction * 7);
++    const loaded = await fetchWeek(nextDate);
++    if (loaded) setSelectedDate(nextDate);
++  }
++
++  function dateFromPointer(clientX: number) {
++    const grid = timelineGridRef.current;
++    if (!grid) return selectedDate;
++    if (viewMode === "day") return selectedDate;
++    const rect = grid.getBoundingClientRect();
++    const width = rect.width / 7;
++    const index = Math.max(0, Math.min(6, Math.floor((clientX - rect.left) / width)));
++    return visibleDates[index] ?? selectedDate;
++  }
++
++  function mutateBlocks(updater: (current: CalendarBlock[]) => CalendarBlock[]) {
++    setBlocks((current) => {
++      const next = updater(current);
++      blocksRef.current = next;
+       return next;
+     });
+-    markChanged();
+   }
+ 
+-  const busy = pendingSaves > 0;
++  function updateBlock(clientId: string, updater: (block: CalendarBlock) => CalendarBlock) {
++    mutateBlocks((current) => current.map((block) => (block.client_id === clientId ? updater(block) : block)));
++  }
++
++  function openEditor(block: CalendarBlock) {
++    setEditingId(block.client_id);
++    setEditorDraft({
++      client_id: block.client_id,
++      activity_date: block.activity_date,
++      start_minute: block.start_minute,
++      end_minute: block.end_minute,
++      category_id: block.category_id,
++      title: block.title ?? categoryMap.get(block.category_id)?.name ?? "",
++      note: block.note ?? "",
++    });
++  }
++
++  function closeEditor() {
++    setEditingId(null);
++    setEditorDraft(null);
++  }
++
++  function addBlockAt(date = selectedDate, minute?: number) {
++    if (!selectedCategory) return;
++    const category = categoryMap.get(selectedCategory);
++    const start = clampBlockStart(minute ?? Math.min(20 * 60, Math.max(0, snapMinute(currentMinute))), 60);
++    const block: CalendarBlock = {
++      client_id: makeClientId(),
++      activity_date: date,
++      start_minute: start,
++      end_minute: start + 60,
++      category_id: selectedCategory,
++      title: category?.name ?? "Aktivitas",
++      note: null,
++      source: "manual",
++    };
++    if (!canPlace(block, blocksRef.current)) {
++      setError("Waktu tersebut sudah memiliki dua aktivitas. Pilih waktu lain.");
++      return;
++    }
++    mutateBlocks((current) => [...current, block]);
++    markDatesDirty(date);
++    openEditor(block);
++  }
++
++  function startCreate(event: ReactPointerEvent<HTMLDivElement>, date: string) {
++    if (event.button !== 0 || !selectedCategory || !timelineGridRef.current) return;
++    const minute = Math.min(1425, minutesFromPointer(event.clientY, timelineGridRef.current));
++    const category = categoryMap.get(selectedCategory);
++    const block: CalendarBlock = {
++      client_id: makeClientId(),
++      activity_date: date,
++      start_minute: minute,
++      end_minute: Math.min(1440, minute + 60),
++      category_id: selectedCategory,
++      title: category?.name ?? "Aktivitas",
++      note: null,
++      source: "manual",
++    };
++    event.currentTarget.setPointerCapture(event.pointerId);
++    interactionRef.current = {
++      type: "create",
++      pointerId: event.pointerId,
++      blockId: block.client_id,
++      anchorMinute: minute,
++      original: block,
++      moved: false,
++    };
++    mutateBlocks((current) => [...current, block]);
++    setError(null);
++  }
++
++  function startMove(event: ReactPointerEvent<HTMLDivElement>, block: CalendarBlock) {
++    if (event.button !== 0) return;
++    event.stopPropagation();
++    event.currentTarget.setPointerCapture(event.pointerId);
++    interactionRef.current = {
++      type: "move",
++      pointerId: event.pointerId,
++      blockId: block.client_id,
++      original: { ...block },
++      startClientX: event.clientX,
++      startClientY: event.clientY,
++      moved: false,
++    };
++    setSelectedDate(block.activity_date);
++    setError(null);
++  }
++
++  function startResize(
++    event: ReactPointerEvent<HTMLDivElement>,
++    block: CalendarBlock,
++    type: "resize-start" | "resize-end",
++  ) {
++    if (event.button !== 0) return;
++    event.stopPropagation();
++    event.currentTarget.setPointerCapture(event.pointerId);
++    interactionRef.current = {
++      type,
++      pointerId: event.pointerId,
++      blockId: block.client_id,
++      original: { ...block },
++      moved: false,
++    };
++    setSelectedDate(block.activity_date);
++    setError(null);
++  }
++
++  function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
++    const interaction = interactionRef.current;
++    const grid = timelineGridRef.current;
++    if (!interaction || !grid || event.pointerId !== interaction.pointerId) return;
++
++    if (interaction.type === "create") {
++      const pointerMinute = minutesFromPointer(event.clientY, grid);
++      interaction.moved = Math.abs(pointerMinute - interaction.anchorMinute) >= SNAP;
++      if (!interaction.moved) return;
++
++      const start = pointerMinute < interaction.anchorMinute ? pointerMinute : interaction.anchorMinute;
++      const end = pointerMinute < interaction.anchorMinute
++        ? interaction.anchorMinute
++        : Math.max(interaction.anchorMinute + MIN_DURATION, pointerMinute);
++
++      updateBlock(interaction.blockId, (block) => ({
++        ...block,
++        start_minute: Math.max(0, Math.min(1425, start)),
++        end_minute: Math.max(MIN_DURATION, Math.min(1440, end)),
++      }));
++      return;
++    }
++
++    if (interaction.type === "move") {
++      const duration = interaction.original.end_minute - interaction.original.start_minute;
++      const deltaMinute = snapDelta((event.clientY - interaction.startClientY) / MINUTE_PX);
++      const nextStart = clampBlockStart(interaction.original.start_minute + deltaMinute, duration);
++      const nextDate = dateFromPointer(event.clientX);
++      interaction.moved =
++        interaction.moved ||
++        Math.abs(event.clientX - interaction.startClientX) > 4 ||
++        Math.abs(event.clientY - interaction.startClientY) > 4;
++      updateBlock(interaction.blockId, (block) => ({
++        ...block,
++        activity_date: nextDate,
++        start_minute: nextStart,
++        end_minute: nextStart + duration,
++      }));
++      return;
++    }
++
++    const pointerMinute = minutesFromPointer(event.clientY, grid);
++    interaction.moved = true;
++    updateBlock(interaction.blockId, (block) => {
++      if (interaction.type === "resize-start") {
++        return {
++          ...block,
++          start_minute: Math.max(0, Math.min(block.end_minute - MIN_DURATION, pointerMinute)),
++        };
++      }
++      return {
++        ...block,
++        end_minute: Math.min(1440, Math.max(block.start_minute + MIN_DURATION, pointerMinute)),
++      };
++    });
++  }
++
++  function handlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
++    const interaction = interactionRef.current;
++    if (!interaction || event.pointerId !== interaction.pointerId) return;
++    interactionRef.current = null;
++
++    const current = blocksRef.current.find((block) => block.client_id === interaction.blockId);
++    if (!current) return;
++
++    if (!canPlace(current, blocksRef.current)) {
++      if (interaction.type === "create") {
++        mutateBlocks((items) => items.filter((block) => block.client_id !== interaction.blockId));
++      } else {
++        mutateBlocks((items) =>
++          items.map((block) => (block.client_id === interaction.blockId ? interaction.original : block)),
++        );
++      }
++      setError("Maksimal dua aktivitas boleh overlap pada waktu yang sama.");
++      return;
++    }
++
++    if (interaction.type === "create") {
++      markDatesDirty(current.activity_date);
++      setSelectedDate(current.activity_date);
++      openEditor(current);
++      return;
++    }
++
++    if (interaction.type === "move") {
++      if (!interaction.moved) {
++        openEditor(current);
++        return;
++      }
++      markDatesDirty(interaction.original.activity_date, current.activity_date);
++      setSelectedDate(current.activity_date);
++      return;
++    }
++
++    markDatesDirty(interaction.original.activity_date, current.activity_date);
++  }
++
++  function saveEditor() {
++    if (!editorDraft) return;
++    const original = blocksRef.current.find((block) => block.client_id === editorDraft.client_id);
++    if (!original) return;
++
++    const category = categoryMap.get(editorDraft.category_id);
++    const candidate: CalendarBlock = {
++      ...original,
++      activity_date: editorDraft.activity_date,
++      start_minute: editorDraft.start_minute,
++      end_minute: editorDraft.end_minute,
++      category_id: editorDraft.category_id,
++      title: editorDraft.title.trim() || category?.name || "Aktivitas",
++      note: editorDraft.note.trim() || null,
++    };
++
++    if (candidate.end_minute <= candidate.start_minute) {
++      setError("Jam selesai harus setelah jam mulai.");
++      return;
++    }
++    if (!canPlace(candidate, blocksRef.current)) {
++      setError("Perubahan ini membuat lebih dari dua aktivitas overlap.");
++      return;
++    }
++
++    mutateBlocks((items) => items.map((block) => (block.client_id === candidate.client_id ? candidate : block)));
++    markDatesDirty(original.activity_date, candidate.activity_date);
++    setSelectedDate(candidate.activity_date);
++    closeEditor();
++  }
++
++  function deleteEditorBlock() {
++    if (!editorDraft) return;
++    const original = blocksRef.current.find((block) => block.client_id === editorDraft.client_id);
++    if (!original) return;
++    mutateBlocks((items) => items.filter((block) => block.client_id !== editorDraft.client_id));
++    markDatesDirty(original.activity_date);
++    closeEditor();
++  }
++
++  function duplicateEditorBlock() {
++    if (!editorDraft) return;
++    const original = blocksRef.current.find((block) => block.client_id === editorDraft.client_id);
++    if (!original) return;
++    const duration = original.end_minute - original.start_minute;
++    const start = clampBlockStart(original.end_minute, duration);
++    const copy: CalendarBlock = {
++      ...original,
++      client_id: makeClientId(),
++      id: undefined,
++      start_minute: start,
++      end_minute: start + duration,
++      title: original.title ? `${original.title} copy` : categoryMap.get(original.category_id)?.name ?? "Aktivitas",
++    };
++    if (!canPlace(copy, blocksRef.current)) {
++      setError("Tidak ada ruang untuk duplicate block setelah aktivitas ini.");
++      return;
++    }
++    mutateBlocks((items) => [...items, copy]);
++    markDatesDirty(copy.activity_date);
++    openEditor(copy);
++  }
++
++  const headerLabel =
++    viewMode === "week"
++      ? `${formatCompactDate(rangeStart)} – ${formatCompactDate(rangeEnd)}`
++      : formatDateKey(selectedDate, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+ 
+   return (
+-    <div
+-      onPointerMove={(event) => {
+-        if (!dragging.current || mode === "select") return;
+-        const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-timeline-slot]");
+-        const slotValue = target?.dataset.timelineSlot;
+-        if (slotValue) apply(Number(slotValue));
+-      }}
+-      onPointerUp={() => (dragging.current = false)}
+-      onPointerCancel={() => (dragging.current = false)}
+-    >
+-      <div className="flex flex-col gap-3 rounded-xl border border-border bg-card p-4 sm:flex-row sm:items-center sm:justify-between">
+-        <div className="flex flex-wrap items-center gap-2">
+-          <button onClick={() => void loadDate(shiftDateKey(cursor, -1))} disabled={loading || busy} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Previous day"><ChevronLeft className="size-4" /></button>
+-          <button onClick={() => void loadDate(initialDate)} disabled={loading || busy} className="min-w-44 rounded-lg border border-border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">{formatDateKey(cursor, { weekday: "short", day: "numeric", month: "short", year: "numeric" })}</button>
+-          <button onClick={() => void loadDate(shiftDateKey(cursor, 1))} disabled={loading || busy} className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50" aria-label="Next day"><ChevronRight className="size-4" /></button>
+-          {cursor !== initialDate ? <button onClick={() => void loadDate(initialDate)} disabled={loading || busy} className="rounded-lg px-2 py-2 text-xs font-medium text-primary hover:bg-muted disabled:opacity-50">Today</button> : null}
++    <div onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp}>
++      <div className="rounded-xl border border-border bg-card p-3 sm:p-4">
++        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
++          <div className="flex flex-wrap items-center gap-2">
++            <button
++              type="button"
++              onClick={() => void shiftVisible(-1)}
++              disabled={loading || busy}
++              className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50"
++              aria-label={viewMode === "week" ? "Previous week" : "Previous day"}
++            >
++              <ChevronLeft className="size-4" />
++            </button>
++            <button
++              type="button"
++              onClick={() => void goToDate(initialDate)}
++              disabled={loading || busy}
++              className="rounded-lg border border-border px-3 py-2 text-sm font-semibold hover:bg-muted disabled:opacity-50"
++            >
++              Today
++            </button>
++            <button
++              type="button"
++              onClick={() => void shiftVisible(1)}
++              disabled={loading || busy}
++              className="grid size-9 place-items-center rounded-lg border border-border hover:bg-muted disabled:opacity-50"
++              aria-label={viewMode === "week" ? "Next week" : "Next day"}
++            >
++              <ChevronRight className="size-4" />
++            </button>
++            <div className="min-w-0 px-1 text-sm font-semibold sm:text-base">{headerLabel}</div>
++            <input
++              type="date"
++              value={selectedDate}
++              onChange={(event) => void goToDate(event.target.value)}
++              className="rounded-lg border border-border bg-background px-2 py-1.5 text-xs outline-none focus:border-primary"
++              aria-label="Jump to date"
++            />
++          </div>
++
++          <div className="flex flex-wrap items-center gap-2">
++            <div className="inline-flex rounded-lg border border-border bg-muted/50 p-1">
++              <button
++                type="button"
++                onClick={() => setView("week")}
++                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium ${viewMode === "week" ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}
++              >
++                <CalendarDays className="size-3.5" /> Week
++              </button>
++              <button
++                type="button"
++                onClick={() => setView("day")}
++                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium ${viewMode === "day" ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}
++              >
++                <Clock3 className="size-3.5" /> Day
++              </button>
++            </div>
++
++            {loading ? (
++              <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" /> Loading</span>
++            ) : busy ? (
++              <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"><Loader2 className="size-3 animate-spin" /> Saving</span>
++            ) : dirtyDates.size ? (
++              <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">Unsaved</span>
++            ) : (
++              <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">Saved</span>
++            )}
++
++            <button
++              type="button"
++              onClick={() => void queueSave(false)}
++              disabled={loading || busy}
++              className="inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground disabled:opacity-50"
++            >
++              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
++              Save now
++            </button>
++          </div>
+         </div>
+-        <div className="flex flex-wrap items-center gap-3 text-sm">
+-          {loading ? <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" /> Loading</span> : busy ? <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2 py-1 text-xs font-medium text-primary"><Loader2 className="size-3 animate-spin" /> Saving</span> : dirty ? <span className="rounded-full bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-300">Unsaved</span> : <span className="rounded-full bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-300">Saved</span>}
+-          <span className="text-muted-foreground">Coverage</span><span className="font-mono font-medium tabular-nums">{formatDuration(tracked)} · {Math.round((tracked / 1440) * 100)}%</span>
++
++        <div className="mt-3 flex gap-2 overflow-x-auto pb-1">
++          {activeCategories.map((category) => (
++            <button
++              type="button"
++              key={category.id}
++              onClick={() => setSelectedCategory(category.id)}
++              className={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${selectedCategory === category.id ? "border-foreground bg-foreground text-background" : "border-border hover:bg-muted"}`}
++            >
++              <span className="size-2 rounded-full" style={{ backgroundColor: category.color }} />
++              {category.name}
++            </button>
++          ))}
++          <button
++            type="button"
++            onClick={() => addBlockAt()}
++            className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-dashed border-border px-3 py-1.5 text-xs font-semibold hover:bg-muted"
++          >
++            <Plus className="size-3.5" /> New block
++          </button>
+         </div>
+       </div>
+ 
+       {error ? <div className="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">{error}</div> : null}
+       {message ? <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300"><CheckCircle2 className="size-4" /> {message}</div> : null}
+ 
+-      <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_300px]">
+-        <section className="overflow-hidden rounded-xl border border-border bg-card">
+-          <div className="sticky top-0 z-10 border-b border-border bg-card/95 p-3 backdrop-blur">
+-            <div className="flex gap-2 overflow-x-auto pb-1 sm:flex-wrap sm:overflow-visible">{activeCategories.map((category) => <button key={category.id} onClick={() => setSelected(category.id)} className={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${selected === category.id ? "border-foreground bg-foreground text-background" : "border-border hover:bg-muted"}`}><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</button>)}</div>
+-            <div className="mt-3 inline-flex rounded-lg border border-border bg-muted/50 p-1">{([ ["select", MousePointer2, "Select"], ["paint", Paintbrush, "Isi"], ["erase", Eraser, "Hapus"] ] as const).map(([value, Icon, label]) => <button key={value} onClick={() => setMode(value)} className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium ${mode === value ? "bg-card text-foreground shadow-sm" : "text-muted-foreground"}`}><Icon className="size-3.5" /> {label}</button>)}</div>
++      <section className="mt-4 overflow-hidden rounded-xl border border-border bg-card">
++        <div ref={scrollRef} className="max-h-[74vh] overflow-auto overscroll-contain">
++          <div className={viewMode === "week" ? "min-w-[980px]" : "min-w-0"}>
++            <div
++              className="sticky top-0 z-40 grid border-b border-border bg-card/95 backdrop-blur"
++              style={{ gridTemplateColumns: `64px repeat(${visibleDates.length}, minmax(0, 1fr))` }}
++            >
++              <div className="border-r border-border px-2 py-3 text-center font-mono text-[10px] text-muted-foreground">WITA</div>
++              {visibleDates.map((date) => {
++                const active = date === selectedDate;
++                const today = date === todayKey;
++                return (
++                  <button
++                    type="button"
++                    key={date}
++                    onClick={() => setSelectedDate(date)}
++                    className={`border-r border-border px-2 py-2 text-center transition-colors last:border-r-0 ${active ? "bg-primary/5" : "hover:bg-muted/60"}`}
++                  >
++                    <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
++                      {formatDateKey(date, { weekday: "short" })}
++                    </div>
++                    <div className={`mx-auto mt-1 grid size-9 place-items-center rounded-full text-lg font-medium ${today ? "bg-primary text-primary-foreground" : ""}`}>
++                      {Number(date.slice(-2))}
++                    </div>
++                  </button>
++                );
++              })}
++            </div>
++
++            <div className="grid" style={{ gridTemplateColumns: "64px minmax(0, 1fr)" }}>
++              <div className="relative border-r border-border bg-card" style={{ height: DAY_HEIGHT }}>
++                {Array.from({ length: 24 }, (_, hour) => (
++                  <div
++                    key={hour}
++                    className="absolute right-2 -translate-y-1/2 font-mono text-[10px] tabular-nums text-muted-foreground"
++                    style={{ top: hour * HOUR_HEIGHT }}
++                  >
++                    {minuteLabel(hour * 60)}
++                  </div>
++                ))}
++              </div>
++
++              <div
++                ref={timelineGridRef}
++                className="relative grid bg-card"
++                style={{
++                  height: DAY_HEIGHT,
++                  gridTemplateColumns: `repeat(${visibleDates.length}, minmax(0, 1fr))`,
++                }}
++              >
++                {Array.from({ length: 25 }, (_, hour) => (
++                  <div
++                    key={hour}
++                    className="pointer-events-none absolute inset-x-0 border-t border-border/80"
++                    style={{ top: hour * HOUR_HEIGHT }}
++                  />
++                ))}
++                {Array.from({ length: 96 }, (_, slot) => (
++                  <div
++                    key={`minor-${slot}`}
++                    className={`pointer-events-none absolute inset-x-0 border-t ${slot % 4 === 0 ? "border-transparent" : "border-border/20"}`}
++                    style={{ top: slot * SNAP * MINUTE_PX }}
++                  />
++                ))}
++
++                {visibleDates.map((date) => {
++                  const dayBlocks = visibleBlocks.filter((block) => block.activity_date === date);
++                  const layout = dayLayout(dayBlocks);
++                  return (
++                    <div
++                      key={date}
++                      data-day={date}
++                      onPointerDown={(event) => startCreate(event, date)}
++                      className={`relative border-r border-border/80 last:border-r-0 ${selectedDate === date ? "bg-primary/[0.015]" : ""}`}
++                      style={{ height: DAY_HEIGHT }}
++                    >
++                      {date === todayKey ? (
++                        <div
++                          className="pointer-events-none absolute inset-x-0 z-30 flex items-center"
++                          style={{ top: currentMinute * MINUTE_PX }}
++                        >
++                          <span className="-ml-1 size-2.5 rounded-full bg-rose-500" />
++                          <span className="h-px flex-1 bg-rose-500" />
++                        </div>
++                      ) : null}
++
++                      {dayBlocks.map((block) => {
++                        const category = categoryMap.get(block.category_id);
++                        const position = layout.get(block.client_id) ?? { lane: 0, split: false };
++                        const height = Math.max(18, (block.end_minute - block.start_minute) * MINUTE_PX - 2);
++                        const left = position.split ? `calc(${position.lane * 50}% + 3px)` : "3px";
++                        const width = position.split ? "calc(50% - 6px)" : "calc(100% - 6px)";
++                        const color = category?.color ?? "#64748b";
++                        const foreground = textColor(color);
++                        return (
++                          <div
++                            key={block.client_id}
++                            onPointerDown={(event) => startMove(event, block)}
++                            className="group absolute z-20 overflow-hidden rounded-md border border-black/10 px-2 py-1 shadow-sm transition-shadow hover:z-30 hover:shadow-md dark:border-white/10"
++                            style={{
++                              top: block.start_minute * MINUTE_PX + 1,
++                              height,
++                              left,
++                              width,
++                              backgroundColor: color,
++                              color: foreground,
++                              touchAction: "none",
++                              cursor: "grab",
++                            }}
++                            title={`${block.title || category?.name || "Aktivitas"} · ${minuteLabel(block.start_minute)}–${minuteLabel(block.end_minute)}`}
++                          >
++                            <div
++                              onPointerDown={(event) => startResize(event, block, "resize-start")}
++                              className="absolute inset-x-1 top-0 h-1.5 cursor-ns-resize rounded-full opacity-0 transition-opacity group-hover:opacity-80"
++                              style={{ backgroundColor: foreground }}
++                            />
++                            <div className="truncate text-[11px] font-semibold leading-4 sm:text-xs">
++                              {block.title || category?.name || "Aktivitas"}
++                            </div>
++                            {height >= 34 ? (
++                              <div className="truncate text-[10px] leading-3 opacity-90">
++                                {minuteLabel(block.start_minute)} – {minuteLabel(block.end_minute)}
++                              </div>
++                            ) : null}
++                            {height >= 54 ? (
++                              <div className="mt-0.5 truncate text-[10px] leading-3 opacity-80">{category?.name}</div>
++                            ) : null}
++                            {height >= 74 && block.note ? (
++                              <div className="mt-1 line-clamp-2 text-[10px] leading-3 opacity-75">{block.note}</div>
++                            ) : null}
++                            <div
++                              onPointerDown={(event) => startResize(event, block, "resize-end")}
++                              className="absolute inset-x-1 bottom-0 h-1.5 cursor-ns-resize rounded-full opacity-0 transition-opacity group-hover:opacity-80"
++                              style={{ backgroundColor: foreground }}
++                            />
++                          </div>
++                        );
++                      })}
++                    </div>
++                  );
++                })}
++              </div>
++            </div>
+           </div>
++        </div>
++      </section>
+ 
+-          <div className="max-h-[68vh] overflow-y-auto p-3 sm:p-4">
+-            <div className="grid grid-cols-[52px_1fr] gap-x-3">{Array.from({ length: 96 }, (_, slot) => { const minute = slot * 15; const hourMark = minute % 60 === 0; const entries = slots[slot] ?? []; const names = entries.map((id) => categoryMap.get(id)?.name).filter(Boolean).join(", "); return <div key={slot} className="contents"><div className={`flex h-4 items-start justify-end pr-1 font-mono text-[10px] tabular-nums ${hourMark ? "text-muted-foreground" : "text-transparent"}`}>{hourMark ? minuteLabel(minute) : "·"}</div><div role="button" tabIndex={0} aria-label={`${minuteLabel(minute)} ${names || "empty"}`} data-timeline-slot={slot} onPointerDown={() => { if (mode === "select") { setFocusedSlot(slot); return; } dragging.current = true; apply(slot); }} className={`h-4 touch-none border-t transition-[filter] hover:brightness-110 ${hourMark ? "border-border" : "border-border/35"}`} style={{ background: cellBackground(entries) }} /></div>; })}</div>
++      <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
++        <div className="rounded-xl border border-border bg-card p-4">
++          <p className="text-xs font-medium text-muted-foreground">Selected day</p>
++          <p className="mt-1 text-sm font-semibold">{formatCompactDate(selectedDate)}</p>
++        </div>
++        <div className="rounded-xl border border-border bg-card p-4">
++          <p className="text-xs font-medium text-muted-foreground">Coverage</p>
++          <p className="mt-1 font-mono text-sm font-semibold">{formatDuration(selectedCoverage)} · {Math.round((selectedCoverage / 1440) * 100)}%</p>
++        </div>
++        <div className="rounded-xl border border-border bg-card p-4 sm:col-span-2">
++          <p className="text-xs font-medium text-muted-foreground">Activity time</p>
++          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1.5">
++            {Array.from(dayTotals.entries()).length ? Array.from(dayTotals.entries()).sort((a, b) => b[1] - a[1]).map(([categoryId, minutes]) => {
++              const category = categoryMap.get(categoryId);
++              if (!category) return null;
++              return <span key={categoryId} className="inline-flex items-center gap-1.5 text-xs"><span className="size-2 rounded-full" style={{ backgroundColor: category.color }} />{category.name}<span className="font-mono text-muted-foreground">{formatDuration(minutes)}</span></span>;
++            }) : <span className="text-xs text-muted-foreground">Belum ada aktivitas.</span>}
+           </div>
+-        </section>
++        </div>
++      </div>
+ 
+-        <aside className="space-y-4">
+-          <div className="rounded-xl border border-border bg-card p-4"><div className="flex items-center justify-between"><h2 className="font-semibold">Day totals</h2><span className="font-mono text-xs text-muted-foreground">activity time</span></div><div className="mt-3 space-y-2.5">{Object.entries(totals).length ? Object.entries(totals).sort((a, b) => b[1] - a[1]).map(([categoryId, minutes]) => { const category = categoryMap.get(categoryId); if (!category) return null; return <div key={categoryId} className="flex items-center justify-between gap-3 text-sm"><span className="flex min-w-0 items-center gap-2 truncate"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span><span className="font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(minutes)}</span></div>; }) : <p className="text-sm text-muted-foreground">Belum ada aktivitas pada tanggal ini.</p>}</div></div>
++      {editingId && editorDraft ? (
++        <div className="fixed inset-0 z-[90] flex items-end justify-center bg-black/45 p-0 backdrop-blur-[2px] sm:items-center sm:p-4" onMouseDown={(event) => { if (event.currentTarget === event.target) closeEditor(); }}>
++          <div className="w-full max-w-lg rounded-t-2xl border border-border bg-card shadow-2xl sm:rounded-2xl">
++            <div className="flex items-center justify-between border-b border-border px-4 py-3">
++              <div>
++                <h2 className="font-semibold">Edit activity</h2>
++                <p className="mt-0.5 text-xs text-muted-foreground">15-minute precision · drag the calendar block to move it.</p>
++              </div>
++              <button type="button" onClick={closeEditor} className="grid size-9 place-items-center rounded-lg hover:bg-muted" aria-label="Close editor"><X className="size-4" /></button>
++            </div>
+ 
+-          {focusedSlot !== null ? <div className="rounded-xl border border-border bg-card p-4"><div className="flex items-center justify-between gap-3"><div><h2 className="font-semibold">Block note</h2><p className="mt-1 font-mono text-xs text-muted-foreground">{minuteLabel(focusedSlot * 15)}</p></div><button onClick={() => setFocusedSlot(null)} className="text-xs font-medium text-muted-foreground hover:text-foreground">Close</button></div><div className="mt-3 space-y-3">{(slots[focusedSlot] ?? []).length ? (slots[focusedSlot] ?? []).map((categoryId) => { const category = categoryMap.get(categoryId); if (!category) return null; return <label key={categoryId} className="block text-xs font-medium"><span className="mb-1.5 flex items-center gap-2"><span className="size-2 rounded-full" style={{ background: category.color }} />{category.name}</span><textarea value={notes[`${focusedSlot}:${categoryId}`] ?? ""} onChange={(event) => setRunNote(categoryId, focusedSlot, event.target.value)} rows={3} maxLength={500} placeholder="Catatan opsional untuk block ini…" className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm font-normal outline-none focus:border-primary" /></label>; }) : <p className="text-sm text-muted-foreground">Slot ini kosong. Pilih slot berwarna untuk memberi catatan.</p>}</div></div> : null}
++            <div className="space-y-4 p-4">
++              <label className="block text-xs font-medium">
++                Title
++                <input
++                  value={editorDraft.title}
++                  onChange={(event) => setEditorDraft({ ...editorDraft, title: event.target.value })}
++                  maxLength={120}
++                  placeholder="Contoh: JLPT N2 Dokkai"
++                  className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                />
++              </label>
+ 
+-          <div className="rounded-xl border border-border bg-card p-4"><h2 className="font-semibold">Save behavior</h2><ul className="mt-3 space-y-2 text-sm leading-5 text-muted-foreground"><li>• Autosave setelah ±0,6 detik.</li><li>• Pindah tanggal menunggu save selesai.</li><li>• Pindah menu dari Timeline juga menunggu save.</li><li>• Tombol Save now selalu bisa dipakai untuk force-save.</li><li>• 96 slot/hari, maksimal 2 aktivitas overlap.</li></ul></div>
++              <label className="block text-xs font-medium">
++                Category
++                <select
++                  value={editorDraft.category_id}
++                  onChange={(event) => setEditorDraft({ ...editorDraft, category_id: event.target.value })}
++                  className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                >
++                  {activeCategories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
++                </select>
++              </label>
+ 
+-          <button onClick={() => void queueSave(false, true)} disabled={loading || busy} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50">{busy ? <Loader2 className="size-4 animate-spin" /> : <Save className="size-4" />} {busy ? "Saving…" : "Save now"}</button>
+-        </aside>
+-      </div>
++              <div className="grid gap-3 sm:grid-cols-3">
++                <label className="block text-xs font-medium">
++                  Date
++                  <input
++                    type="date"
++                    value={editorDraft.activity_date}
++                    onChange={(event) => setEditorDraft({ ...editorDraft, activity_date: event.target.value })}
++                    className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                  />
++                </label>
++                <label className="block text-xs font-medium">
++                  Start
++                  <input
++                    type="time"
++                    step={900}
++                    value={minuteToInput(editorDraft.start_minute)}
++                    onChange={(event) => setEditorDraft({ ...editorDraft, start_minute: inputToMinute(event.target.value) })}
++                    className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                  />
++                </label>
++                <label className="block text-xs font-medium">
++                  End
++                  <input
++                    type="time"
++                    step={900}
++                    value={minuteToInput(Math.min(1439, editorDraft.end_minute))}
++                    onChange={(event) => {
++                      const raw = inputToMinute(event.target.value);
++                      setEditorDraft({ ...editorDraft, end_minute: raw <= editorDraft.start_minute ? editorDraft.start_minute + SNAP : raw });
++                    }}
++                    className="mt-1.5 w-full rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                  />
++                </label>
++              </div>
++
++              <label className="block text-xs font-medium">
++                Note
++                <textarea
++                  value={editorDraft.note}
++                  onChange={(event) => setEditorDraft({ ...editorDraft, note: event.target.value })}
++                  rows={4}
++                  maxLength={500}
++                  placeholder="Catatan opsional…"
++                  className="mt-1.5 w-full resize-none rounded-lg border border-border bg-background px-3 py-2.5 text-sm outline-none focus:border-primary"
++                />
++              </label>
++            </div>
++
++            <div className="flex flex-wrap items-center gap-2 border-t border-border p-4">
++              <button type="button" onClick={deleteEditorBlock} className="inline-flex items-center gap-2 rounded-lg border border-rose-500/30 px-3 py-2 text-sm font-semibold text-rose-600 hover:bg-rose-500/10"><Trash2 className="size-4" /> Delete</button>
++              <button type="button" onClick={duplicateEditorBlock} className="rounded-lg border border-border px-3 py-2 text-sm font-semibold hover:bg-muted">Duplicate</button>
++              <div className="flex-1" />
++              <button type="button" onClick={closeEditor} className="rounded-lg border border-border px-3 py-2 text-sm font-semibold hover:bg-muted">Cancel</button>
++              <button type="button" onClick={saveEditor} className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground"><Save className="size-4" /> Save</button>
++            </div>
++          </div>
++        </div>
++      ) : null}
+     </div>
+   );
+ }
+diff --git a/src/lib/date.ts b/src/lib/date.ts
+index 4b3c82d..4ff7dd4 100644
+--- a/src/lib/date.ts
++++ b/src/lib/date.ts
+@@ -26,6 +26,16 @@ export function formatDateKey(dateKey: string, options?: Intl.DateTimeFormatOpti
+   }).format(new Date(`${dateKey}T12:00:00Z`));
+ }
+ 
++
++export function sundayWeekRange(dateKey: string) {
++  const date = new Date(`${dateKey}T12:00:00Z`);
++  const day = date.getUTCDay();
++  return {
++    start: shiftDateKey(dateKey, -day),
++    end: shiftDateKey(dateKey, 6 - day),
++  };
++}
++
+ export function weekRange(dateKey: string) {
+   const date = new Date(`${dateKey}T12:00:00Z`);
+   const day = date.getUTCDay();
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 9aee528..5805fd5 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -21,6 +21,7 @@ export type TimeBlock = {
+   start_minute: number;
+   end_minute: number;
+   category_id: string;
++  title: string | null;
+   note: string | null;
+   source?: string;
+ };
+diff --git a/supabase/migrations/20261001031000_calendar_block_timeline_v5.sql b/supabase/migrations/20261001031000_calendar_block_timeline_v5.sql
+new file mode 100644
+index 0000000..0aaf91d
+--- /dev/null
++++ b/supabase/migrations/20261001031000_calendar_block_timeline_v5.sql
+@@ -0,0 +1,158 @@
++-- V5: calendar-style manual Timeline with titles and atomic multi-day saves.
++
++alter table public.time_blocks
++  add column if not exists title text;
++
++update public.time_blocks tb
++set title = c.name
++from public.categories c
++where c.id = tb.category_id
++  and (tb.title is null or btrim(tb.title) = '');
++
++alter table public.time_blocks
++  drop constraint if exists time_blocks_title_length;
++
++alter table public.time_blocks
++  add constraint time_blocks_title_length
++  check (title is null or char_length(title) <= 120);
++
++create or replace function public.save_timeline_days(p_days jsonb)
++returns void
++language plpgsql
++security invoker
++set search_path = public, pg_temp
++as $$
++declare
++  v_uid uuid := (select auth.uid());
++  v_day jsonb;
++  v_date date;
++  v_blocks jsonb;
++begin
++  if v_uid is null then
++    raise exception 'Authentication required';
++  end if;
++
++  if p_days is null or jsonb_typeof(p_days) <> 'array' then
++    raise exception 'days must be a JSON array';
++  end if;
++
++  for v_day in
++    select value from jsonb_array_elements(p_days)
++  loop
++    if coalesce(v_day->>'activity_date', '') = '' then
++      raise exception 'activity_date is required';
++    end if;
++
++    v_date := (v_day->>'activity_date')::date;
++    v_blocks := coalesce(v_day->'blocks', '[]'::jsonb);
++
++    if jsonb_typeof(v_blocks) <> 'array' then
++      raise exception 'blocks must be a JSON array';
++    end if;
++
++    if exists (
++      select 1
++      from jsonb_array_elements(v_blocks) item
++      left join public.categories c
++        on c.id = (item->>'category_id')::uuid
++       and c.user_id = v_uid
++      where c.id is null
++    ) then
++      raise exception 'A block references a category that does not belong to this user';
++    end if;
++
++    if exists (
++      select 1
++      from jsonb_array_elements(v_blocks) item
++      where
++        (item->>'start_minute')::int < 0
++        or (item->>'start_minute')::int > 1425
++        or (item->>'end_minute')::int < 15
++        or (item->>'end_minute')::int > 1440
++        or (item->>'end_minute')::int <= (item->>'start_minute')::int
++        or (item->>'start_minute')::int % 15 <> 0
++        or (item->>'end_minute')::int % 15 <> 0
++        or char_length(coalesce(item->>'title', '')) > 120
++        or char_length(coalesce(item->>'note', '')) > 500
++    ) then
++      raise exception 'Invalid Timeline block';
++    end if;
++
++    if exists (
++      select 1
++      from generate_series(0, 1425, 15) minute_mark
++      where (
++        select count(*)
++        from jsonb_array_elements(v_blocks) item
++        where (item->>'start_minute')::int <= minute_mark
++          and (item->>'end_minute')::int > minute_mark
++      ) > 2
++    ) then
++      raise exception 'A 15-minute slot cannot contain more than two activities';
++    end if;
++
++    delete from public.time_blocks
++    where user_id = v_uid
++      and activity_date = v_date;
++
++    insert into public.time_blocks (
++      user_id,
++      activity_date,
++      start_minute,
++      end_minute,
++      category_id,
++      title,
++      note,
++      source,
++      external_id,
++      external_calendar_id
++    )
++    select
++      v_uid,
++      v_date,
++      (item->>'start_minute')::smallint,
++      (item->>'end_minute')::smallint,
++      c.id,
++      coalesce(nullif(btrim(item->>'title'), ''), c.name),
++      nullif(item->>'note', ''),
++      'manual',
++      null,
++      null
++    from jsonb_array_elements(v_blocks) item
++    join public.categories c
++      on c.id = (item->>'category_id')::uuid
++     and c.user_id = v_uid;
++  end loop;
++
++  perform public.refresh_milestones();
++end;
++$$;
++
++revoke all on function public.save_timeline_days(jsonb) from public;
++revoke all on function public.save_timeline_days(jsonb) from anon;
++grant execute on function public.save_timeline_days(jsonb) to authenticated;
++
++create or replace function public.save_day_time_blocks(
++  p_activity_date date,
++  p_blocks jsonb
++)
++returns void
++language plpgsql
++security invoker
++set search_path = public, pg_temp
++as $$
++begin
++  perform public.save_timeline_days(
++    jsonb_build_array(
++      jsonb_build_object(
++        'activity_date', p_activity_date,
++        'blocks', coalesce(p_blocks, '[]'::jsonb)
++      )
++    )
++  );
++end;
++$$;
++
++revoke all on function public.save_day_time_blocks(date, jsonb) from public;
++revoke all on function public.save_day_time_blocks(date, jsonb) from anon;
++grant execute on function public.save_day_time_blocks(date, jsonb) to authenticated;
+diff --git a/supabase/schema.sql b/supabase/schema.sql
+index 49f8288..b0f0316 100644
+--- a/supabase/schema.sql
++++ b/supabase/schema.sql
+@@ -32,6 +32,7 @@ create table if not exists public.time_blocks (
+   start_minute smallint not null check (start_minute between 0 and 1425 and start_minute % 15 = 0),
+   end_minute smallint not null check (end_minute between 15 and 1440 and end_minute % 15 = 0),
+   category_id uuid not null references public.categories(id) on delete restrict,
++  title text check (title is null or char_length(title) <= 120),
+   note text check (note is null or char_length(note) <= 500),
+   source text not null default 'manual' check (source in ('manual','google_calendar','import')),
+   external_id text,
+@@ -930,3 +931,163 @@ create unique index time_blocks_calendar_event_unique_idx
+ create index if not exists calendar_preferences_import_category_id_idx
+   on public.calendar_preferences(import_category_id)
+   where import_category_id is not null;
++
++
++-- V5: calendar-style manual Timeline with titles and atomic multi-day saves.
++
++alter table public.time_blocks
++  add column if not exists title text;
++
++update public.time_blocks tb
++set title = c.name
++from public.categories c
++where c.id = tb.category_id
++  and (tb.title is null or btrim(tb.title) = '');
++
++alter table public.time_blocks
++  drop constraint if exists time_blocks_title_length;
++
++alter table public.time_blocks
++  add constraint time_blocks_title_length
++  check (title is null or char_length(title) <= 120);
++
++create or replace function public.save_timeline_days(p_days jsonb)
++returns void
++language plpgsql
++security invoker
++set search_path = public, pg_temp
++as $$
++declare
++  v_uid uuid := (select auth.uid());
++  v_day jsonb;
++  v_date date;
++  v_blocks jsonb;
++begin
++  if v_uid is null then
++    raise exception 'Authentication required';
++  end if;
++
++  if p_days is null or jsonb_typeof(p_days) <> 'array' then
++    raise exception 'days must be a JSON array';
++  end if;
++
++  for v_day in
++    select value from jsonb_array_elements(p_days)
++  loop
++    if coalesce(v_day->>'activity_date', '') = '' then
++      raise exception 'activity_date is required';
++    end if;
++
++    v_date := (v_day->>'activity_date')::date;
++    v_blocks := coalesce(v_day->'blocks', '[]'::jsonb);
++
++    if jsonb_typeof(v_blocks) <> 'array' then
++      raise exception 'blocks must be a JSON array';
++    end if;
++
++    if exists (
++      select 1
++      from jsonb_array_elements(v_blocks) item
++      left join public.categories c
++        on c.id = (item->>'category_id')::uuid
++       and c.user_id = v_uid
++      where c.id is null
++    ) then
++      raise exception 'A block references a category that does not belong to this user';
++    end if;
++
++    if exists (
++      select 1
++      from jsonb_array_elements(v_blocks) item
++      where
++        (item->>'start_minute')::int < 0
++        or (item->>'start_minute')::int > 1425
++        or (item->>'end_minute')::int < 15
++        or (item->>'end_minute')::int > 1440
++        or (item->>'end_minute')::int <= (item->>'start_minute')::int
++        or (item->>'start_minute')::int % 15 <> 0
++        or (item->>'end_minute')::int % 15 <> 0
++        or char_length(coalesce(item->>'title', '')) > 120
++        or char_length(coalesce(item->>'note', '')) > 500
++    ) then
++      raise exception 'Invalid Timeline block';
++    end if;
++
++    if exists (
++      select 1
++      from generate_series(0, 1425, 15) minute_mark
++      where (
++        select count(*)
++        from jsonb_array_elements(v_blocks) item
++        where (item->>'start_minute')::int <= minute_mark
++          and (item->>'end_minute')::int > minute_mark
++      ) > 2
++    ) then
++      raise exception 'A 15-minute slot cannot contain more than two activities';
++    end if;
++
++    delete from public.time_blocks
++    where user_id = v_uid
++      and activity_date = v_date;
++
++    insert into public.time_blocks (
++      user_id,
++      activity_date,
++      start_minute,
++      end_minute,
++      category_id,
++      title,
++      note,
++      source,
++      external_id,
++      external_calendar_id
++    )
++    select
++      v_uid,
++      v_date,
++      (item->>'start_minute')::smallint,
++      (item->>'end_minute')::smallint,
++      c.id,
++      coalesce(nullif(btrim(item->>'title'), ''), c.name),
++      nullif(item->>'note', ''),
++      'manual',
++      null,
++      null
++    from jsonb_array_elements(v_blocks) item
++    join public.categories c
++      on c.id = (item->>'category_id')::uuid
++     and c.user_id = v_uid;
++  end loop;
++
++  perform public.refresh_milestones();
++end;
++$$;
++
++revoke all on function public.save_timeline_days(jsonb) from public;
++revoke all on function public.save_timeline_days(jsonb) from anon;
++grant execute on function public.save_timeline_days(jsonb) to authenticated;
++
++create or replace function public.save_day_time_blocks(
++  p_activity_date date,
++  p_blocks jsonb
++)
++returns void
++language plpgsql
++security invoker
++set search_path = public, pg_temp
++as $$
++begin
++  perform public.save_timeline_days(
++    jsonb_build_array(
++      jsonb_build_object(
++        'activity_date', p_activity_date,
++        'blocks', coalesce(p_blocks, '[]'::jsonb)
++      )
++    )
++  );
++end;
++$$;
++
++revoke all on function public.save_day_time_blocks(date, jsonb) from public;
++revoke all on function public.save_day_time_blocks(date, jsonb) from anon;
++grant execute on function public.save_day_time_blocks(date, jsonb) to authenticated;
