@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 import {
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -73,6 +74,16 @@ type Interaction =
       moved: boolean;
     };
 
+
+type PendingMobileTouch = {
+  pointerId: number;
+  blockId: string;
+  startClientX: number;
+  startClientY: number;
+  moved: boolean;
+  longPressed: boolean;
+};
+
 type SavePayloadDay = {
   activity_date: string;
   blocks: Array<{
@@ -97,6 +108,8 @@ const DAY_HEIGHT = HOUR_HEIGHT * 24;
 const MINUTE_PX = HOUR_HEIGHT / 60;
 const SNAP = 15;
 const MIN_DURATION = 15;
+const MOBILE_HOLD_MS = 420;
+const MOBILE_SCROLL_THRESHOLD = 10;
 
 function makeClientId(block?: TimeBlock) {
   if (block?.id) return `db:${block.id}`;
@@ -250,9 +263,13 @@ export function TimelineEditor({
   const dateVersionsRef = useRef<Record<string, number>>({});
   const saveChain = useRef<Promise<boolean>>(Promise.resolve(true));
   const interactionRef = useRef<Interaction | null>(null);
+  const pendingMobileTouchRef = useRef<PendingMobileTouch | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
   const timelineGridRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [clockTick, setClockTick] = useState(0);
+  const [isMobileInput, setIsMobileInput] = useState(false);
+  const [armedBlockId, setArmedBlockId] = useState<string | null>(null);
 
   blocksRef.current = blocks;
   dirtyDatesRef.current = dirtyDates;
@@ -289,13 +306,25 @@ export function TimelineEditor({
   }, [blocks, selectedDate]);
 
   useEffect(() => {
-    const media = window.matchMedia("(max-width: 767px)");
+    const widthMedia = window.matchMedia("(max-width: 767px)");
+    const pointerMedia = window.matchMedia("(pointer: coarse)");
     const apply = () => {
-      if (!viewTouched.current) setViewMode(media.matches ? "day" : "week");
+      if (!viewTouched.current) setViewMode(widthMedia.matches ? "day" : "week");
+      setIsMobileInput(widthMedia.matches && pointerMedia.matches);
     };
     apply();
-    media.addEventListener("change", apply);
-    return () => media.removeEventListener("change", apply);
+    widthMedia.addEventListener("change", apply);
+    pointerMedia.addEventListener("change", apply);
+    return () => {
+      widthMedia.removeEventListener("change", apply);
+      pointerMedia.removeEventListener("change", apply);
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (longPressTimerRef.current !== null) window.clearTimeout(longPressTimerRef.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -521,6 +550,18 @@ export function TimelineEditor({
     setEditorDraft(null);
   }
 
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  function clearPendingMobileTouch() {
+    clearLongPressTimer();
+    pendingMobileTouchRef.current = null;
+  }
+
   function addBlockAt(date = selectedDate, minute?: number) {
     if (!selectedCategory) return;
     const category = categoryMap.get(selectedCategory);
@@ -545,7 +586,7 @@ export function TimelineEditor({
   }
 
   function startCreate(event: ReactPointerEvent<HTMLDivElement>, date: string) {
-    if (event.button !== 0 || !selectedCategory || !timelineGridRef.current) return;
+    if (event.pointerType === "touch" || event.button !== 0 || !selectedCategory || !timelineGridRef.current) return;
     const minute = Math.min(1425, minutesFromPointer(event.clientY, timelineGridRef.current));
     const category = categoryMap.get(selectedCategory);
     const block: CalendarBlock = {
@@ -574,6 +615,30 @@ export function TimelineEditor({
   function startMove(event: ReactPointerEvent<HTMLDivElement>, block: CalendarBlock) {
     if (event.button !== 0) return;
     event.stopPropagation();
+
+    if (event.pointerType === "touch" && isMobileInput && armedBlockId !== block.client_id) {
+      clearPendingMobileTouch();
+      if (armedBlockId) setArmedBlockId(null);
+      const pending: PendingMobileTouch = {
+        pointerId: event.pointerId,
+        blockId: block.client_id,
+        startClientX: event.clientX,
+        startClientY: event.clientY,
+        moved: false,
+        longPressed: false,
+      };
+      pendingMobileTouchRef.current = pending;
+      longPressTimerRef.current = window.setTimeout(() => {
+        const current = pendingMobileTouchRef.current;
+        if (!current || current.pointerId !== event.pointerId || current.moved) return;
+        current.longPressed = true;
+        setArmedBlockId(block.client_id);
+        setMessage("Move mode aktif. Lepas jari, lalu drag blok untuk memindahkan; tap area kosong untuk batal.");
+        if (typeof navigator !== "undefined" && "vibrate" in navigator) navigator.vibrate(15);
+      }, MOBILE_HOLD_MS);
+      return;
+    }
+
     event.currentTarget.setPointerCapture(event.pointerId);
     interactionRef.current = {
       type: "move",
@@ -594,6 +659,7 @@ export function TimelineEditor({
     type: "resize-start" | "resize-end",
   ) {
     if (event.button !== 0) return;
+    if (event.pointerType === "touch" && isMobileInput && armedBlockId !== block.client_id) return;
     event.stopPropagation();
     event.currentTarget.setPointerCapture(event.pointerId);
     interactionRef.current = {
@@ -608,9 +674,23 @@ export function TimelineEditor({
   }
 
   function handlePointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    const pendingTouch = pendingMobileTouchRef.current;
+    if (!interactionRef.current && pendingTouch && event.pointerId === pendingTouch.pointerId) {
+      const distance = Math.hypot(
+        event.clientX - pendingTouch.startClientX,
+        event.clientY - pendingTouch.startClientY,
+      );
+      if (distance > MOBILE_SCROLL_THRESHOLD) {
+        pendingTouch.moved = true;
+        clearLongPressTimer();
+      }
+      return;
+    }
+
     const interaction = interactionRef.current;
     const grid = timelineGridRef.current;
     if (!interaction || !grid || event.pointerId !== interaction.pointerId) return;
+    if (event.pointerType === "touch") event.preventDefault();
 
     if (interaction.type === "create") {
       const pointerMinute = minutesFromPointer(event.clientY, grid);
@@ -665,9 +745,21 @@ export function TimelineEditor({
   }
 
   function handlePointerUp(event: ReactPointerEvent<HTMLDivElement>) {
+    const pendingTouch = pendingMobileTouchRef.current;
+    if (!interactionRef.current && pendingTouch && event.pointerId === pendingTouch.pointerId) {
+      clearLongPressTimer();
+      pendingMobileTouchRef.current = null;
+      if (!pendingTouch.moved && !pendingTouch.longPressed) {
+        const block = blocksRef.current.find((item) => item.client_id === pendingTouch.blockId);
+        if (block) openEditor(block);
+      }
+      return;
+    }
+
     const interaction = interactionRef.current;
     if (!interaction || event.pointerId !== interaction.pointerId) return;
     interactionRef.current = null;
+    if (event.pointerType === "touch") setArmedBlockId(null);
 
     const current = blocksRef.current.find((block) => block.client_id === interaction.blockId);
     if (!current) return;
@@ -702,6 +794,38 @@ export function TimelineEditor({
     }
 
     markDatesDirty(interaction.original.activity_date, current.activity_date);
+  }
+
+  function handlePointerCancel(event: ReactPointerEvent<HTMLDivElement>) {
+    const pendingTouch = pendingMobileTouchRef.current;
+    if (pendingTouch && pendingTouch.pointerId === event.pointerId) {
+      clearPendingMobileTouch();
+      return;
+    }
+
+    const interaction = interactionRef.current;
+    if (!interaction || interaction.pointerId !== event.pointerId) return;
+    interactionRef.current = null;
+    if (interaction.type === "create") {
+      mutateBlocks((items) => items.filter((block) => block.client_id !== interaction.blockId));
+    } else {
+      mutateBlocks((items) =>
+        items.map((block) => (block.client_id === interaction.blockId ? interaction.original : block)),
+      );
+    }
+    setArmedBlockId(null);
+  }
+
+  function handleMobileDayTap(event: ReactMouseEvent<HTMLDivElement>, date: string) {
+    if (!isMobileInput || event.target !== event.currentTarget) return;
+    if (armedBlockId) {
+      setArmedBlockId(null);
+      setMessage(null);
+      return;
+    }
+    if (!timelineGridRef.current) return;
+    const minute = Math.min(1425, minutesFromPointer(event.clientY, timelineGridRef.current));
+    addBlockAt(date, minute);
   }
 
   function saveEditor() {
@@ -773,7 +897,7 @@ export function TimelineEditor({
       : formatDateKey(selectedDate, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
   return (
-    <div onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp}>
+    <div onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerCancel}>
       <div className="rounded-xl border border-border bg-card p-3 sm:p-4">
         <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
           <div className="flex flex-wrap items-center gap-2">
@@ -873,13 +997,20 @@ export function TimelineEditor({
             <Plus className="size-3.5" /> New block
           </button>
         </div>
+        <div className="mt-3 rounded-lg border border-border bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground md:hidden">
+          <span className="font-semibold text-foreground">HP:</span> scroll Timeline seperti biasa. Tap blok untuk edit. Hold sekitar 0,4 detik sampai move mode aktif, lepas jari, lalu drag blok. Tap area kosong untuk membuat aktivitas baru.
+        </div>
       </div>
 
       {error ? <div className="mt-3 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">{error}</div> : null}
       {message ? <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-300"><CheckCircle2 className="size-4" /> {message}</div> : null}
 
       <section className="mt-4 overflow-hidden rounded-xl border border-border bg-card">
-        <div ref={scrollRef} className="max-h-[74vh] overflow-auto overscroll-contain">
+        <div
+          ref={scrollRef}
+          className="max-h-[74vh] overflow-auto overscroll-contain"
+          style={{ WebkitOverflowScrolling: "touch", touchAction: "pan-x pan-y" }}
+        >
           <div className={viewMode === "week" ? "min-w-[980px]" : "min-w-0"}>
             <div
               className="sticky top-0 z-40 grid border-b border-border bg-card/95 backdrop-blur"
@@ -951,8 +1082,9 @@ export function TimelineEditor({
                       key={date}
                       data-day={date}
                       onPointerDown={(event) => startCreate(event, date)}
+                      onClick={(event) => handleMobileDayTap(event, date)}
                       className={`relative border-r border-border/80 last:border-r-0 ${selectedDate === date ? "bg-primary/[0.015]" : ""}`}
-                      style={{ height: DAY_HEIGHT }}
+                      style={{ height: DAY_HEIGHT, touchAction: isMobileInput ? "pan-x pan-y" : "auto" }}
                     >
                       {date === todayKey ? (
                         <div
@@ -972,11 +1104,13 @@ export function TimelineEditor({
                         const width = position.split ? "calc(50% - 6px)" : "calc(100% - 6px)";
                         const color = category?.color ?? "#64748b";
                         const foreground = textColor(color);
+                        const armed = armedBlockId === block.client_id;
                         return (
                           <div
                             key={block.client_id}
                             onPointerDown={(event) => startMove(event, block)}
-                            className="group absolute z-20 overflow-hidden rounded-md border border-black/10 px-2 py-1 shadow-sm transition-shadow hover:z-30 hover:shadow-md dark:border-white/10"
+                            onClick={(event) => event.stopPropagation()}
+                            className={`group absolute overflow-hidden rounded-md border border-black/10 px-2 py-1 shadow-sm transition-[box-shadow,transform] hover:z-30 hover:shadow-md dark:border-white/10 ${armed ? "z-40 ring-2 ring-white/90 ring-offset-2 ring-offset-background" : "z-20"}`}
                             style={{
                               top: block.start_minute * MINUTE_PX + 1,
                               height,
@@ -984,14 +1118,19 @@ export function TimelineEditor({
                               width,
                               backgroundColor: color,
                               color: foreground,
-                              touchAction: "none",
-                              cursor: "grab",
+                              touchAction: isMobileInput ? (armed ? "none" : "pan-x pan-y") : "none",
+                              cursor: armed ? "grabbing" : "grab",
                             }}
                             title={`${block.title || category?.name || "Aktivitas"} · ${minuteLabel(block.start_minute)}–${minuteLabel(block.end_minute)}`}
                           >
+                            {armed ? (
+                              <div className="pointer-events-none absolute right-1 top-1 rounded bg-black/25 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white">
+                                move
+                              </div>
+                            ) : null}
                             <div
                               onPointerDown={(event) => startResize(event, block, "resize-start")}
-                              className="absolute inset-x-1 top-0 h-1.5 cursor-ns-resize rounded-full opacity-0 transition-opacity group-hover:opacity-80"
+                              className={`absolute inset-x-1 top-0 h-2.5 cursor-ns-resize rounded-full transition-opacity sm:h-1.5 ${armed ? "opacity-80" : "opacity-0 group-hover:opacity-80"}`}
                               style={{ backgroundColor: foreground }}
                             />
                             <div className="truncate text-[11px] font-semibold leading-4 sm:text-xs">
@@ -1010,7 +1149,7 @@ export function TimelineEditor({
                             ) : null}
                             <div
                               onPointerDown={(event) => startResize(event, block, "resize-end")}
-                              className="absolute inset-x-1 bottom-0 h-1.5 cursor-ns-resize rounded-full opacity-0 transition-opacity group-hover:opacity-80"
+                              className={`absolute inset-x-1 bottom-0 h-2.5 cursor-ns-resize rounded-full transition-opacity sm:h-1.5 ${armed ? "opacity-80" : "opacity-0 group-hover:opacity-80"}`}
                               style={{ backgroundColor: foreground }}
                             />
                           </div>
